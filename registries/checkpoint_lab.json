@@ -1,0 +1,38 @@
+{
+  "subscriber_id": "checkpoint_lab",
+  "workers": {
+    "generate_images": {
+      "command": [
+        "python3",
+        "-m",
+        "checkpoint_lab.workers.generate_images",
+        "--config",
+        "${CHECKPOINT_LAB_PROJECT_ROOT}\\config.toml"
+      ],
+      "working_directory": "${CHECKPOINT_LAB_PROJECT_ROOT}",
+      "timeout_seconds": 1800
+    },
+    "analyze_images": {
+      "command": [
+        "python3",
+        "-m",
+        "checkpoint_lab.workers.analyze_images",
+        "--config",
+        "${CHECKPOINT_LAB_PROJECT_ROOT}\\config.toml"
+      ],
+      "working_directory": "${CHECKPOINT_LAB_PROJECT_ROOT}",
+      "timeout_seconds": 1200
+    },
+    "refine_recipe": {
+      "command": [
+        "python3",
+        "-m",
+        "checkpoint_lab.workers.refine_recipe",
+        "--config",
+        "${CHECKPOINT_LAB_PROJECT_ROOT}\\config.toml"
+      ],
+      "working_directory": "${CHECKPOINT_LAB_PROJECT_ROOT}",
+      "timeout_seconds": 900
+    }
+  }
+}
