@@ -1,0 +1,25 @@
+{
+  "subscriber_id": "zet",
+  "workers": {
+    "ollama": {
+      "command": [
+        "python3",
+        "-m",
+        "AI_Manager.ollama_proxy_worker"
+      ],
+      "working_directory": "${ZET_PROJECT_ROOT}",
+      "timeout_seconds": 7500
+    },
+    "local_image": {
+      "command": [
+        "python3",
+        "-m",
+        "AI_Manager.local_image_proxy_worker",
+        "--config",
+        "${ZET_PROJECT_ROOT}\\config.toml"
+      ],
+      "working_directory": "${ZET_PROJECT_ROOT}",
+      "timeout_seconds": 7500
+    }
+  }
+}

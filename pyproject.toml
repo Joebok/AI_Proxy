@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "file-job-proxy"
+version = "1.0.0"
+description = "Application-agnostic filesystem job proxy"
+requires-python = ">=3.10"
+
+[project.scripts]
+file-proxy = "file_proxy.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["file_proxy*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
