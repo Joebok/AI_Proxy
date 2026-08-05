@@ -9,6 +9,13 @@ application payload schema.
 This document is the integration contract for an AI agent adding proxy support
 to another application.
 
+This is a personal project designed for my limited local resources to throttle 
+LLM and local image generation to one job at a time. It was particularly developed for the
+Zet project (https://github.com/Joebok/Zet) but has use more generally to manage local resources. Note also that 
+several machines can be connected to the queue to run jobs in parallel.
+
+This project is provided "as-is". No promises of updates or backwards compatiblity.
+
 ## Transport model
 
 Treat `File_Proxy` as an **eventually consistent message transport**, not as a
@@ -675,3 +682,7 @@ Before declaring another application integrated, verify:
 - Only the subscriber's own answer namespace is scanned.
 - Tests cover success, worker failure, timeout, malformed payload, partial sync,
   duplicate harvest, and an intentional retry using a new job ID.
+
+## License
+
+Copyright (c) 2026 Joe Schonbok. Licensed under the [MIT License](LICENSE).

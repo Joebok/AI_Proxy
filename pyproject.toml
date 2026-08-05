@@ -6,6 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "file-job-proxy"
 version = "1.0.0"
 description = "Application-agnostic filesystem job proxy"
+authors = [{ name = "Joe Schonbok" }]
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
