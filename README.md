@@ -179,7 +179,7 @@ Restart the proxy after registry changes, then validate:
 
 ```powershell
 $env:EXAMPLE_APP_ROOT = "C:\path\to\example_app"
-file-proxy --root "C:\path\to\AI_Queue" --registry-dir ".\registries" validate-subscriber example_app
+.\.venv\Scripts\file-proxy.exe --root "C:\path\to\AI_Queue" --registry-dir ".\registries" validate-subscriber example_app
 ```
 
 ### 3. Implement atomic publication
@@ -587,25 +587,46 @@ should preserve unknown future error types rather than rejecting the result.
 
 ## Installation and operation
 
-Python 3.10 or newer is required:
+Python 3.10 or newer is required. Each deployment uses a local `.venv`; do not
+install or run the proxy with the system Python environment.
+
+For a new Windows deployment:
+
+1. Install Python 3.10 or newer and clone this repository.
+2. Open PowerShell or Command Prompt in the repository root.
+3. Run `setup_venv.ps1` from PowerShell or `setup_venv.bat` from Command
+   Prompt. The setup script creates `.venv`, installs the proxy and its test
+   dependency in editable mode, and runs the test suite.
+4. Set any machine-specific subscriber variables described by its registry.
+   For the included Zet registry, `ZET_PROJECT_ROOT` defaults to a sibling
+   `Zet` checkout. Set `AI_QUEUE_ROOT` if the queue is not at
+   `%USERPROFILE%\Dropbox\AI_Queue`.
+5. Start the proxy with `run_file_proxy.ps1` or `run_file_proxy.bat`. Both
+   launch `.venv\Scripts\python.exe` directly; activation is not required.
+
+Equivalent manual setup and verification:
 
 ```powershell
-python3 -m pip install -e .
-python3 -m pytest
+python3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --editable ".[dev]"
+.\.venv\Scripts\python.exe -m pytest
 ```
 
-Run continuously:
+Run continuously without a wrapper:
 
 ```powershell
-file-proxy --root "C:\path\to\AI_Queue" --registry-dir ".\registries" run
+.\.venv\Scripts\file-proxy.exe --root "C:\path\to\AI_Queue" --registry-dir ".\registries" run
 ```
+
+After pulling changes that modify `pyproject.toml`, rerun the setup script to
+refresh the environment.
 
 Useful commands:
 
 ```text
-file-proxy --root ROOT --registry-dir REGISTRIES once
-file-proxy --root ROOT --registry-dir REGISTRIES status [--subscriber ID] [--job ID]
-file-proxy --root ROOT --registry-dir REGISTRIES validate-subscriber ID
+.venv\Scripts\file-proxy.exe --root ROOT --registry-dir REGISTRIES once
+.venv\Scripts\file-proxy.exe --root ROOT --registry-dir REGISTRIES status [--subscriber ID] [--job ID]
+.venv\Scripts\file-proxy.exe --root ROOT --registry-dir REGISTRIES validate-subscriber ID
 ```
 
 `run` also accepts `--poll-seconds` and `--sync-grace-seconds`.

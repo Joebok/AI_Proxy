@@ -33,6 +33,17 @@
       ],
       "working_directory": "${CHECKPOINT_LAB_PROJECT_ROOT}",
       "timeout_seconds": 900
+    },
+    "discover_checkpoints": {
+      "command": [
+        "python3",
+        "-m",
+        "checkpoint_lab.workers.discover_checkpoints",
+        "--config",
+        "${CHECKPOINT_LAB_PROJECT_ROOT}\\config.toml"
+      ],
+      "working_directory": "${CHECKPOINT_LAB_PROJECT_ROOT}",
+      "timeout_seconds": 120
     }
   }
 }

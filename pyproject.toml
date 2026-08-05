@@ -8,6 +8,9 @@ version = "1.0.0"
 description = "Application-agnostic filesystem job proxy"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.scripts]
 file-proxy = "file_proxy.cli:main"
 
