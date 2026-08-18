@@ -9,6 +9,7 @@ description = "Application-agnostic filesystem job proxy"
 authors = [{ name = "Joe Schonbok" }]
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
+dependencies = ["aiohttp>=3.11,<4"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

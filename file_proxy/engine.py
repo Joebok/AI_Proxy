@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ from collections.abc import Callable
 
 from .models import InvalidJob, JobManifest, JobNotReady, ProxyResult, QueueJob, iso_utc, utc_now
 from .registry import Registry
+from .scheduler import HttpQueue
 from .validation import build_file_inventory, validate_job_folder
 
 
@@ -243,13 +245,23 @@ class Proxy:
         jobs.sort(key=lambda item: (item.manifest.created_at, item.manifest.subscriber_id, item.manifest.job_id))
         return jobs, invalid
 
-    def process_once(self) -> Path | None:
+    def _select_file_job(
+        self,
+    ) -> QueueJob | tuple[Path, str, str, str] | None:
         jobs, invalid = self._scan()
         if invalid:
-            return self._invalid(*invalid[0])
+            return invalid[0]
         if not jobs:
             return None
-        queued = jobs[0]
+        return jobs[0]
+
+    def _process_file_job(
+        self,
+        selected: QueueJob | tuple[Path, str, str, str],
+    ) -> Path:
+        if isinstance(selected, tuple):
+            return self._invalid(*selected)
+        queued = selected
         manifest = queued.manifest
         self.logger(
             f"Starting {manifest.subscriber_id}/{manifest.job_id} "
@@ -343,6 +355,49 @@ class Proxy:
             f"{status} in {result.duration_seconds:.3f}s"
         )
         return answer
+
+    def process_once(self) -> Path | None:
+        selected = self._select_file_job()
+        if selected is None:
+            return None
+        return self._process_file_job(selected)
+
+    async def run_scheduler(
+        self,
+        http_queue: HttpQueue,
+        poll_seconds: float = 1.0,
+        continuation_grace_seconds: float = 2.0,
+    ) -> None:
+        last_http_completed: float | None = None
+        loop = asyncio.get_running_loop()
+        while True:
+            http_job = http_queue.pop()
+            if http_job is not None:
+                if not http_job.started.done():
+                    http_job.started.set_result(None)
+                await http_job.finished
+                last_http_completed = loop.time()
+                continue
+
+            if last_http_completed is not None:
+                remaining = continuation_grace_seconds - (loop.time() - last_http_completed)
+                if remaining > 0:
+                    await http_queue.wait(remaining)
+                    continue
+                last_http_completed = None
+
+            selected = await asyncio.to_thread(self._select_file_job)
+            if http_queue.has_waiting():
+                continue
+            if selected is None:
+                await http_queue.wait(poll_seconds)
+                continue
+            worker_task = asyncio.create_task(asyncio.to_thread(self._process_file_job, selected))
+            try:
+                await asyncio.shield(worker_task)
+            except asyncio.CancelledError:
+                await worker_task
+                raise
 
     def run(self, poll_seconds: float = 1.0) -> None:
         self.ensure_layout()

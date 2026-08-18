@@ -638,6 +638,75 @@ Useful commands:
 
 `run` also accepts `--poll-seconds` and `--sync-grace-seconds`.
 
+## Queued Ollama HTTP proxy
+
+Continuous mode can also accept Ollama HTTP requests and schedule them with
+filesystem jobs. HTTP and filesystem work use separate FIFO queues. When the
+resource becomes free, the oldest HTTP request is selected first; otherwise the
+oldest filesystem job runs. Active work is never preempted.
+
+Each HTTP request holds the resource only from the start of its upstream Ollama
+request through the end of its response stream. Conversation state is not kept
+by this proxy. Clients such as OpenCode send the prior messages again with each
+request, so later turns can be interleaved with filesystem jobs.
+
+Start on a dedicated local port while Ollama remains on its default port:
+
+```powershell
+.\.venv\Scripts\file-proxy.exe --root "C:\path\to\AI_Queue" --registry-dir ".\registries" run `
+  --http-listen-port 11433 `
+  --ollama-upstream "http://127.0.0.1:11434"
+```
+
+Configure OpenCode to use the queued endpoint:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "queued-ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Queued Ollama",
+      "options": {
+        "baseURL": "http://127.0.0.1:11433/v1"
+      },
+      "models": {
+        "qwen3-coder": {
+          "name": "Qwen3 Coder"
+        }
+      }
+    }
+  }
+}
+```
+
+For a transparent replacement, configure Ollama itself to bind another port,
+such as `127.0.0.1:11435`, and start this proxy on `11434` with that address as
+its upstream. Startup fails if the listener and upstream are the same endpoint.
+
+The proxy queues all routes except these read-only discovery calls, which pass
+through immediately:
+
+- `GET /api/ps`
+- `GET /api/tags`
+- `GET /api/version`
+- `GET /v1/models`
+
+Add another bypass with `--http-bypass-route "METHOD /path"`. Request and
+response bodies are forwarded without interpretation. Ollama NDJSON and
+OpenAI-compatible SSE responses are streamed incrementally.
+
+After an HTTP response, the scheduler waits two seconds by default for a
+follow-up HTTP request before starting a filesystem job. Configure this with
+`--http-continuation-grace-seconds`. A follow-up arriving after a filesystem
+job starts waits for that job to finish.
+
+The launch scripts enable HTTP mode when `AI_PROXY_HTTP_PORT` is set. They also
+accept `AI_PROXY_HTTP_HOST`, `AI_PROXY_OLLAMA_UPSTREAM`,
+`AI_PROXY_HTTP_CONTINUATION_GRACE_SECONDS`, `AI_PROXY_HTTP_MAX_BODY_BYTES`, and
+`AI_PROXY_HTTP_UPSTREAM_TIMEOUT_SECONDS`. The HTTP queue is memory-only;
+disconnects and process restarts cannot be recovered as live HTTP requests.
+
 ## Dropbox deployment
 
 Keep only transport envelopes in Dropbox. Install the proxy, subscriber
