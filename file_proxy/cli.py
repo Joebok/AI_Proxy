@@ -40,6 +40,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         registry = Registry.load(args.registry_dir)
         logger = (lambda message: print(f"[file-proxy] {message}", flush=True)) if args.command == "run" else None
+        http_logger = (lambda message: print(f"[http-proxy] {message}", flush=True)) if args.command == "run" else None
         proxy = Proxy(
             args.root,
             registry,
@@ -62,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
                         upstream_timeout_seconds=args.http_upstream_timeout_seconds,
                         bypass_routes=frozenset(bypass_routes),
                     )
-                    asyncio.run(run_http_proxy(proxy, config, args.poll_seconds))
+                    asyncio.run(run_http_proxy(proxy, config, args.poll_seconds, http_logger))
             except KeyboardInterrupt:
                 print("\n[file-proxy] Stopped.", flush=True)
                 return 0

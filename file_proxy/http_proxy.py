@@ -220,9 +220,11 @@ async def run_http_proxy(
     proxy: Proxy,
     config: HttpProxyConfig,
     poll_seconds: float,
+    http_logger: Callable[[str], None] | None = None,
 ) -> None:
     queue = HttpQueue()
-    service = HttpProxyService(config, queue, proxy.logger)
+    logger = http_logger or proxy.logger
+    service = HttpProxyService(config, queue, logger)
     proxy.ensure_layout()
     proxy.logger(f"Queue root: {proxy.root}")
     with proxy.lock():
@@ -231,7 +233,7 @@ async def run_http_proxy(
         if recovered:
             proxy.logger(f"Recovered {recovered} interrupted job(s)")
         await service.start()
-        proxy.logger("Ready; HTTP requests have priority over filesystem jobs. Press Ctrl-C to stop.")
+        logger("Ready; HTTP requests have priority over filesystem jobs. Press Ctrl-C to stop.")
         try:
             await proxy.run_scheduler(
                 queue,
