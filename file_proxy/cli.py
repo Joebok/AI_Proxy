@@ -19,6 +19,9 @@ def parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run")
     run.add_argument("--poll-seconds", type=float, default=1.0)
     run.add_argument("--sync-grace-seconds", type=float, default=300.0)
+    run.add_argument("--max-resource-streak", type=int, default=5)
+    run.add_argument("--forge-upstream", default="http://127.0.0.1:7860")
+    run.add_argument("--forge-unload-timeout-seconds", type=float, default=30.0)
     run.add_argument("--http-listen-host", default="127.0.0.1")
     run.add_argument("--http-listen-port", type=int)
     run.add_argument("--ollama-upstream", default="http://127.0.0.1:11434")
@@ -46,6 +49,9 @@ def main(argv: list[str] | None = None) -> int:
             registry,
             logger=logger,
             sync_grace_seconds=getattr(args, "sync_grace_seconds", 300.0),
+            max_resource_streak=getattr(args, "max_resource_streak", 5),
+            forge_upstream=getattr(args, "forge_upstream", None),
+            forge_unload_timeout_seconds=getattr(args, "forge_unload_timeout_seconds", 30.0),
         )
         if args.command == "run":
             try:

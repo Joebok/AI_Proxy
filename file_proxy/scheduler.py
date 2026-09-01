@@ -11,6 +11,7 @@ class HttpJob:
     request_id: str
     started: asyncio.Future[None]
     finished: asyncio.Future[None]
+    resource_key: str | None = None
     cancelled: bool = False
 
 
@@ -20,7 +21,7 @@ class HttpQueue:
         self._changed = asyncio.Event()
         self._closed = False
 
-    def enqueue(self) -> HttpJob:
+    def enqueue(self, resource_key: str | None = None) -> HttpJob:
         if self._closed:
             raise RuntimeError("HTTP queue is shutting down")
         loop = asyncio.get_running_loop()
@@ -28,6 +29,7 @@ class HttpQueue:
             request_id=uuid.uuid4().hex,
             started=loop.create_future(),
             finished=loop.create_future(),
+            resource_key=resource_key,
         )
         self._jobs.append(job)
         self._changed.set()

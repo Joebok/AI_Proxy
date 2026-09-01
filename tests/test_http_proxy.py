@@ -8,7 +8,7 @@ from aiohttp import ClientSession, web
 import pytest
 
 from file_proxy.engine import Proxy
-from file_proxy.http_proxy import HttpProxyConfig, HttpProxyService, parse_bypass_route
+from file_proxy.http_proxy import HttpProxyConfig, HttpProxyService, parse_bypass_route, request_resource_key
 from file_proxy.registry import Registry
 from file_proxy.scheduler import HttpQueue
 
@@ -35,6 +35,13 @@ def test_http_configuration_validation() -> None:
     assert parse_bypass_route("get /health") == ("GET", "/health")
     with pytest.raises(ValueError, match="METHOD /path"):
         parse_bypass_route("/health")
+
+
+def test_request_resource_key_reads_models_only_from_inference_routes() -> None:
+    assert request_resource_key("POST", "/api/chat", b'{"model":"vision:latest"}') == "ollama:vision:latest"
+    assert request_resource_key("POST", "/v1/embeddings", b'{"model":"embed:latest"}') == "ollama:embed:latest"
+    assert request_resource_key("POST", "/api/pull", b'{"model":"vision:latest"}') is None
+    assert request_resource_key("POST", "/api/chat", b"not-json") is None
 
 
 @pytest.mark.parametrize(

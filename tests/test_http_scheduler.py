@@ -40,6 +40,36 @@ def test_http_queue_is_fifo(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_completed_http_resource_drives_next_file_selection(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        proxy = make_proxy(tmp_path)
+        queue = HttpQueue()
+        file_started = threading.Event()
+        selections = [object()]
+        proxy._select_file_job = lambda: selections.pop(0) if selections else None  # type: ignore[method-assign]
+
+        def process_file(_selected) -> None:
+            assert proxy._resource_key == "ollama:vision"
+            assert proxy._resource_streak == 1
+            file_started.set()
+
+        proxy._process_file_job = process_file  # type: ignore[method-assign]
+        http_job = queue.enqueue("ollama:vision")
+        scheduler = asyncio.create_task(
+            proxy.run_scheduler(queue, poll_seconds=0.01, continuation_grace_seconds=0)
+        )
+        try:
+            await asyncio.wait_for(http_job.started, 1)
+            queue.finish(http_job)
+            assert await asyncio.to_thread(file_started.wait, 1)
+        finally:
+            scheduler.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await scheduler
+
+    asyncio.run(scenario())
+
+
 def test_http_has_preference_and_continuation_grace(tmp_path: Path) -> None:
     async def scenario() -> None:
         proxy = make_proxy(tmp_path)

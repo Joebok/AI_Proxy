@@ -45,6 +45,20 @@ def validate_identifier(value: Any, name: str) -> str:
     return value
 
 
+def validate_resource_key(value: Any) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 512
+        or value != value.strip()
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise InvalidJob("resource_key is invalid")
+    return value
+
+
 @dataclass(frozen=True)
 class JobManifest:
     protocol_version: int
@@ -53,6 +67,7 @@ class JobManifest:
     worker: str
     created_at: datetime
     files: tuple[dict[str, Any], ...] = ()
+    resource_key: str | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> "JobManifest":
@@ -70,6 +85,7 @@ class JobManifest:
             worker=validate_identifier(data.get("worker"), "worker"),
             created_at=parse_utc(data.get("created_at")),
             files=tuple(files),
+            resource_key=validate_resource_key(data.get("resource_key")),
         )
 
 

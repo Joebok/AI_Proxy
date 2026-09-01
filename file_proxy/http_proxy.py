@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import json
 import socket
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
@@ -37,6 +38,17 @@ HOP_BY_HOP_HEADERS = frozenset(
         "trailer",
         "transfer-encoding",
         "upgrade",
+    }
+)
+MODEL_ROUTES = frozenset(
+    {
+        ("POST", "/api/chat"),
+        ("POST", "/api/embed"),
+        ("POST", "/api/embeddings"),
+        ("POST", "/api/generate"),
+        ("POST", "/v1/chat/completions"),
+        ("POST", "/v1/completions"),
+        ("POST", "/v1/embeddings"),
     }
 )
 
@@ -107,6 +119,17 @@ def _forward_headers(headers: CIMultiDict[str], *, request: bool) -> list[tuple[
     return [(name, value) for name, value in headers.items() if name.casefold() not in blocked]
 
 
+def request_resource_key(method: str, path: str, body: bytes) -> str | None:
+    if (method, path) not in MODEL_ROUTES:
+        return None
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    model = str(payload.get("model") or "").strip() if isinstance(payload, dict) else ""
+    return f"ollama:{model}" if model else None
+
+
 class HttpProxyService:
     def __init__(
         self,
@@ -157,15 +180,16 @@ class HttpProxyService:
             return await self._relay(request, body, None)
 
         try:
-            job = self.queue.enqueue()
+            job = self.queue.enqueue(request_resource_key(request.method, request.path, body))
         except RuntimeError:
             raise web.HTTPServiceUnavailable(text="AI Proxy is shutting down") from None
+        resource_tag = f"[{job.resource_key}] " if job.resource_key else ""
         self.logger(f"Queued HTTP request {job.request_id}: {request.method} {request.path}")
         try:
             await job.started
             if job.cancelled or self.queue.closed:
                 raise web.HTTPServiceUnavailable(text="AI Proxy is shutting down")
-            self.logger(f"Starting HTTP request {job.request_id}: {request.method} {request.path}")
+            self.logger(f"{resource_tag}Starting HTTP request {job.request_id}: {request.method} {request.path}")
             return await self._relay(request, body, job.request_id)
         except asyncio.CancelledError:
             self.queue.cancel(job)

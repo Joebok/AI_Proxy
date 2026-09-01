@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import socket
 import sys
+import urllib.error
 from unittest.mock import patch
 
 import pytest
@@ -17,9 +18,11 @@ def write_registry(path: Path) -> Registry:
     path.mkdir()
     worker = path.parent / "worker.py"
     worker.write_text(
-        "import argparse, pathlib\n"
+        "import argparse, json, os, pathlib\n"
         "p=argparse.ArgumentParser(); p.add_argument('--job-dir', required=True); a=p.parse_args()\n"
-        "d=pathlib.Path(a.job_dir); (d/'output.txt').write_text(d.name, encoding='utf-8')\n",
+        "d=pathlib.Path(a.job_dir); (d/'output.txt').write_text(d.name, encoding='utf-8')\n"
+        "(d/'resource_hint.json').write_text(json.dumps({k: os.environ.get(k) for k in "
+        "['AI_PROXY_CURRENT_RESOURCE_KEY','AI_PROXY_NEXT_JOB_PRESENT','AI_PROXY_NEXT_RESOURCE_KEY']}), encoding='utf-8')\n",
         encoding="utf-8",
     )
     failing = path.parent / "failing.py"
@@ -60,7 +63,14 @@ def write_registry(path: Path) -> Registry:
     return Registry.load(path)
 
 
-def publish(root: Path, job_id: str, *, created_at: str, worker: str = "mock") -> Path:
+def publish(
+    root: Path,
+    job_id: str,
+    *,
+    created_at: str,
+    worker: str = "mock",
+    resource_key: str | None = None,
+) -> Path:
     parent = root / "Ask" / "zet"
     parent.mkdir(parents=True, exist_ok=True)
     staging = parent / f".{job_id}.staging"
@@ -73,6 +83,7 @@ def publish(root: Path, job_id: str, *, created_at: str, worker: str = "mock") -
                 "subscriber_id": "zet",
                 "worker": worker,
                 "created_at": created_at,
+                **({"resource_key": resource_key} if resource_key else {}),
             }
         ),
         encoding="utf-8",
@@ -150,6 +161,92 @@ def test_success_and_fifo(tmp_path: Path) -> None:
     assert (answer / "output.txt").read_text(encoding="utf-8") == "first"
     assert json.loads((answer / "proxy_result.json").read_text())["status"] == "SUCCEEDED"
     assert (proxy.ask_root / "zet" / "later").exists()
+
+
+def test_resource_affinity_is_bounded_before_oldest_different_job_runs(tmp_path: Path) -> None:
+    proxy = Proxy(
+        tmp_path / "File_Proxy",
+        write_registry(tmp_path / "registry"),
+        max_resource_streak=2,
+    )
+    publish(proxy.root, "a1", created_at="2026-01-01T00:00:01Z", resource_key="ollama:a")
+    publish(proxy.root, "b1", created_at="2026-01-01T00:00:02Z", resource_key="ollama:b")
+    publish(proxy.root, "a2", created_at="2026-01-01T00:00:03Z", resource_key="ollama:a")
+    publish(proxy.root, "a3", created_at="2026-01-01T00:00:04Z", resource_key="ollama:a")
+    publish(proxy.root, "b2", created_at="2026-01-01T00:00:05Z", resource_key="ollama:b")
+
+    processed = [proxy.once().name for _ in range(5)]
+
+    assert processed == ["a1", "a2", "b1", "b2", "a3"]
+
+
+def test_worker_receives_next_scheduled_resource_hint(tmp_path: Path) -> None:
+    messages: list[str] = []
+    proxy = Proxy(
+        tmp_path / "File_Proxy",
+        write_registry(tmp_path / "registry"),
+        logger=messages.append,
+    )
+    publish(proxy.root, "a1", created_at="2026-01-01T00:00:01Z", resource_key="ollama:a")
+    publish(proxy.root, "b1", created_at="2026-01-01T00:00:02Z", resource_key="ollama:b")
+    publish(proxy.root, "a2", created_at="2026-01-01T00:00:03Z", resource_key="ollama:a")
+
+    answer = proxy.once()
+    hint = json.loads((answer / "resource_hint.json").read_text(encoding="utf-8"))
+
+    assert hint == {
+        "AI_PROXY_CURRENT_RESOURCE_KEY": "ollama:a",
+        "AI_PROXY_NEXT_JOB_PRESENT": "1",
+        "AI_PROXY_NEXT_RESOURCE_KEY": "ollama:a",
+    }
+    assert messages[0] == "[ollama:a] Starting zet/a1 with worker mock"
+
+
+def test_forge_checkpoint_is_released_when_entering_ollama_work(tmp_path: Path) -> None:
+    messages: list[str] = []
+    proxy = Proxy(
+        tmp_path / "File_Proxy",
+        write_registry(tmp_path / "registry"),
+        logger=messages.append,
+        forge_upstream="http://127.0.0.1:7860",
+    )
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    with patch("file_proxy.engine.urllib.request.urlopen", return_value=Response()) as post:
+        proxy._prepare_resource("ollama:vision")
+        proxy._record_resource_key("ollama:vision")
+        proxy._prepare_resource("ollama:other")
+
+    assert post.call_count == 1
+    assert post.call_args.args[0].full_url == "http://127.0.0.1:7860/sdapi/v1/unload-checkpoint"
+    assert post.call_args.args[0].method == "POST"
+    assert messages == ["Released Forge checkpoint before ollama:vision"]
+
+
+def test_forge_checkpoint_release_failure_does_not_fail_job(tmp_path: Path) -> None:
+    messages: list[str] = []
+    proxy = Proxy(
+        tmp_path / "File_Proxy",
+        write_registry(tmp_path / "registry"),
+        logger=messages.append,
+        forge_upstream="http://127.0.0.1:7860",
+    )
+
+    with patch(
+        "file_proxy.engine.urllib.request.urlopen",
+        side_effect=urllib.error.URLError("offline"),
+    ):
+        proxy._prepare_resource("ollama:vision")
+
+    assert messages == []
 
 
 def test_staging_is_ignored(tmp_path: Path) -> None:

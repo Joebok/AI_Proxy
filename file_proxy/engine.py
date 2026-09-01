@@ -9,6 +9,9 @@ import subprocess
 import time
 from typing import Any
 from collections.abc import Callable
+import urllib.error
+import urllib.request
+from urllib.parse import urlsplit
 
 from .models import InvalidJob, JobManifest, JobNotReady, ProxyResult, QueueJob, iso_utc, utc_now
 from .registry import Registry
@@ -117,7 +120,18 @@ class Proxy:
         registry: Registry,
         logger: Callable[[str], None] | None = None,
         sync_grace_seconds: float = 300.0,
+        max_resource_streak: int = 5,
+        forge_upstream: str | None = None,
+        forge_unload_timeout_seconds: float = 30.0,
     ):
+        if max_resource_streak <= 0:
+            raise ValueError("max_resource_streak must be positive")
+        if forge_unload_timeout_seconds <= 0:
+            raise ValueError("forge_unload_timeout_seconds must be positive")
+        if forge_upstream:
+            parsed_forge = urlsplit(forge_upstream)
+            if parsed_forge.scheme not in {"http", "https"} or not parsed_forge.hostname:
+                raise ValueError("forge_upstream must be an http or https URL")
         requested_root = root.resolve()
         self.root = (
             requested_root
@@ -127,6 +141,11 @@ class Proxy:
         self.registry = registry
         self.logger = logger or (lambda _message: None)
         self.sync_grace_seconds = sync_grace_seconds
+        self.max_resource_streak = max_resource_streak
+        self._resource_key: str | None = None
+        self._resource_streak = 0
+        self.forge_upstream = forge_upstream.rstrip("/") if forge_upstream else None
+        self.forge_unload_timeout_seconds = forge_unload_timeout_seconds
         self._not_ready_since: dict[Path, float] = {}
         self.ask_root = self.root / "Ask"
         self.running_root = self.root / "Running"
@@ -253,7 +272,62 @@ class Proxy:
             return invalid[0]
         if not jobs:
             return None
-        return jobs[0]
+        return self._choose_resource_job(jobs, self._resource_key, self._resource_streak)
+
+    def _choose_resource_job(
+        self,
+        jobs: list[QueueJob],
+        resource_key: str | None,
+        resource_streak: int,
+    ) -> QueueJob:
+        if resource_key is None:
+            return jobs[0]
+        if resource_streak < self.max_resource_streak:
+            matching = next((job for job in jobs if job.manifest.resource_key == resource_key), None)
+            if matching is not None:
+                return matching
+        different = next((job for job in jobs if job.manifest.resource_key != resource_key), None)
+        return different or jobs[0]
+
+    def _record_resource_job(self, manifest: JobManifest) -> None:
+        self._record_resource_key(manifest.resource_key)
+
+    def _prepare_resource(self, resource_key: str | None) -> None:
+        if (
+            not self.forge_upstream
+            or not resource_key
+            or not resource_key.startswith("ollama:")
+            or self._resource_key is not None and self._resource_key.startswith("ollama:")
+        ):
+            return
+        url = f"{self.forge_upstream}/sdapi/v1/unload-checkpoint"
+        request = urllib.request.Request(url, data=b"", method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=self.forge_unload_timeout_seconds) as response:
+                status = int(response.status)
+            if 200 <= status < 300:
+                self.logger(f"Released Forge checkpoint before {resource_key}")
+        except (urllib.error.URLError, TimeoutError, OSError):
+            pass
+
+    def _record_resource_key(self, resource_key: str | None) -> None:
+        if resource_key is None:
+            self._resource_key = None
+            self._resource_streak = 0
+        elif resource_key == self._resource_key:
+            self._resource_streak += 1
+        else:
+            self._resource_key = resource_key
+            self._resource_streak = 1
+
+    def _next_resource_hint(self) -> tuple[bool, str]:
+        jobs, invalid = self._scan()
+        if invalid:
+            return True, ""
+        if not jobs:
+            return False, ""
+        selected = self._choose_resource_job(jobs, self._resource_key, self._resource_streak)
+        return True, selected.manifest.resource_key or ""
 
     def _process_file_job(
         self,
@@ -263,8 +337,9 @@ class Proxy:
             return self._invalid(*selected)
         queued = selected
         manifest = queued.manifest
+        resource_tag = f"[{manifest.resource_key}] " if manifest.resource_key else ""
         self.logger(
-            f"Starting {manifest.subscriber_id}/{manifest.job_id} "
+            f"{resource_tag}Starting {manifest.subscriber_id}/{manifest.job_id} "
             f"with worker {manifest.worker}"
         )
         registration = self.registry.worker(manifest.subscriber_id, manifest.worker)
@@ -272,6 +347,9 @@ class Proxy:
         running = self.running_root / manifest.subscriber_id / manifest.job_id
         running.parent.mkdir(parents=True, exist_ok=True)
         _replace_with_retry(queued.path, running)
+        self._prepare_resource(manifest.resource_key)
+        self._record_resource_job(manifest)
+        next_job_present, next_resource_key = self._next_resource_hint()
         started = utc_now()
         status = "SUCCEEDED"
         exit_code: int | None = None
@@ -290,6 +368,12 @@ class Proxy:
                 timeout=registration.timeout_seconds,
                 check=False,
                 cwd=registration.working_directory,
+                env={
+                    **os.environ,
+                    "AI_PROXY_CURRENT_RESOURCE_KEY": manifest.resource_key or "",
+                    "AI_PROXY_NEXT_JOB_PRESENT": "1" if next_job_present else "0",
+                    "AI_PROXY_NEXT_RESOURCE_KEY": next_resource_key,
+                },
             )
             exit_code = completed.returncode
             stdout = completed.stdout
@@ -318,6 +402,7 @@ class Proxy:
                     "subscriber_id": manifest.subscriber_id,
                     "worker": manifest.worker,
                     "created_at": iso_utc(manifest.created_at),
+                    "resource_key": manifest.resource_key,
                 },
             )
             status = "FAILED"
@@ -373,6 +458,8 @@ class Proxy:
         while True:
             http_job = http_queue.pop()
             if http_job is not None:
+                await asyncio.to_thread(self._prepare_resource, http_job.resource_key)
+                self._record_resource_key(http_job.resource_key)
                 if not http_job.started.done():
                     http_job.started.set_result(None)
                 await http_job.finished

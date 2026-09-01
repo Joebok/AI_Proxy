@@ -50,8 +50,11 @@ inventory is locally present and valid before harvesting.
 
 ## Delivery and execution semantics
 
-- Jobs from every subscriber share one strict FIFO queue, ordered by
-  `created_at`, then `subscriber_id`, then `job_id`.
+- Jobs from every subscriber are initially ordered by `created_at`, then
+  `subscriber_id`, then `job_id`. Jobs with an optional matching `resource_key`
+  may run together for up to `--max-resource-streak` executions (five by
+  default), after which the oldest job using a different resource gets a turn.
+  Jobs without a resource key retain FIFO behavior.
 - Exactly one registered worker subprocess is launched at a time by the one
   designated proxy instance.
 - There is no automatic retry. A nonzero exit, timeout, launch failure, unsafe
@@ -525,6 +528,7 @@ Every request envelope contains `job.json`:
   "job_id": "2bf640811f704bc3bdb12c978948bf77",
   "subscriber_id": "example_app",
   "worker": "uppercase",
+  "resource_key": "ollama:example-model:latest",
   "created_at": "2026-07-28T20:15:30.123456Z",
   "files": [
     {
@@ -636,14 +640,29 @@ Useful commands:
 .venv\Scripts\file-proxy.exe --root ROOT --registry-dir REGISTRIES validate-subscriber ID
 ```
 
-`run` also accepts `--poll-seconds` and `--sync-grace-seconds`.
+`run` also accepts `--poll-seconds`, `--sync-grace-seconds`, and
+`--max-resource-streak`.
+
+When scheduling enters an Ollama resource after startup or non-Ollama work,
+the proxy makes a best-effort `POST` to
+`<forge-upstream>/sdapi/v1/unload-checkpoint` before starting Ollama. The
+default Forge URL is `http://127.0.0.1:7860`; configure it with
+`--forge-upstream` and `--forge-unload-timeout-seconds`. An unavailable Forge
+service is ignored and does not fail or log an error for the queued Ollama job.
 
 ## Queued Ollama HTTP proxy
 
 Continuous mode can also accept Ollama HTTP requests and schedule them with
-filesystem jobs. HTTP and filesystem work use separate FIFO queues. When the
+filesystem jobs. HTTP and filesystem work use separate queues. When the
 resource becomes free, the oldest HTTP request is selected first; otherwise the
-oldest filesystem job runs. Active work is never preempted.
+bounded resource-affinity policy selects a filesystem job. Active work is never
+preempted.
+
+Queued Ollama and OpenAI-compatible inference requests derive an
+`ollama:<model>` resource key from their JSON body. HTTP requests still have
+priority and remain FIFO; after each runs, its key becomes the affinity used to
+select the next filesystem job. The proxy does not rewrite client-supplied
+`keep_alive` values.
 
 Each HTTP request holds the resource only from the start of its upstream Ollama
 request through the end of its response stream. Conversation state is not kept
