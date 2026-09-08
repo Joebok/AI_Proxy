@@ -7,7 +7,14 @@ from pathlib import Path
 import sys
 
 from .engine import Proxy, ProxyAlreadyRunning
-from .http_proxy import DEFAULT_BYPASS_ROUTES, HttpProxyConfig, parse_bypass_route, run_http_proxy
+from .http_proxy import (
+    COMFYUI_PROFILE,
+    DEFAULT_BYPASS_ROUTES,
+    HttpProxyConfig,
+    OLLAMA_PROFILE,
+    parse_bypass_route,
+    run_http_proxies,
+)
 from .registry import Registry
 
 
@@ -29,6 +36,9 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--http-max-body-bytes", type=int, default=100 * 1024 * 1024)
     run.add_argument("--http-upstream-timeout-seconds", type=float, default=7500.0)
     run.add_argument("--http-bypass-route", action="append", default=[], metavar="'METHOD /path'")
+    run.add_argument("--comfyui-listen-port", type=int, default=None)
+    run.add_argument("--comfyui-upstream", default="http://127.0.0.1:8188")
+    run.add_argument("--http-settle-poll-seconds", type=float, default=1.0)
     commands.add_parser("once")
     status = commands.add_parser("status")
     status.add_argument("--subscriber")
@@ -55,21 +65,44 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.command == "run":
             try:
-                if args.http_listen_port is None:
+                if args.http_listen_port is None and args.comfyui_listen_port is None:
                     proxy.run(args.poll_seconds)
                 else:
-                    bypass_routes = set(DEFAULT_BYPASS_ROUTES)
-                    bypass_routes.update(parse_bypass_route(value) for value in args.http_bypass_route)
-                    config = HttpProxyConfig(
-                        listen_host=args.http_listen_host,
-                        listen_port=args.http_listen_port,
-                        upstream=args.ollama_upstream,
-                        continuation_grace_seconds=args.http_continuation_grace_seconds,
-                        max_body_bytes=args.http_max_body_bytes,
-                        upstream_timeout_seconds=args.http_upstream_timeout_seconds,
-                        bypass_routes=frozenset(bypass_routes),
+                    configs: list[HttpProxyConfig] = []
+                    if args.http_listen_port is not None:
+                        bypass_routes = set(DEFAULT_BYPASS_ROUTES)
+                        bypass_routes.update(
+                            parse_bypass_route(value) for value in args.http_bypass_route
+                        )
+                        configs.append(
+                            HttpProxyConfig(
+                                listen_host=args.http_listen_host,
+                                listen_port=args.http_listen_port,
+                                upstream=args.ollama_upstream,
+                                continuation_grace_seconds=args.http_continuation_grace_seconds,
+                                max_body_bytes=args.http_max_body_bytes,
+                                upstream_timeout_seconds=args.http_upstream_timeout_seconds,
+                                bypass_routes=frozenset(bypass_routes),
+                                profile=OLLAMA_PROFILE,
+                                settle_poll_seconds=args.http_settle_poll_seconds,
+                            )
+                        )
+                    if args.comfyui_listen_port is not None:
+                        configs.append(
+                            HttpProxyConfig(
+                                listen_host=args.http_listen_host,
+                                listen_port=args.comfyui_listen_port,
+                                upstream=args.comfyui_upstream,
+                                continuation_grace_seconds=args.http_continuation_grace_seconds,
+                                max_body_bytes=args.http_max_body_bytes,
+                                upstream_timeout_seconds=args.http_upstream_timeout_seconds,
+                                profile=COMFYUI_PROFILE,
+                                settle_poll_seconds=args.http_settle_poll_seconds,
+                            )
+                        )
+                    asyncio.run(
+                        run_http_proxies(proxy, configs, args.poll_seconds, http_logger)
                     )
-                    asyncio.run(run_http_proxy(proxy, config, args.poll_seconds, http_logger))
             except KeyboardInterrupt:
                 print("\n[file-proxy] Stopped.", flush=True)
                 return 0
