@@ -12,7 +12,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $env:ZET_PROJECT_ROOT "config.toml")
     throw "ZET_PROJECT_ROOT does not contain config.toml: $env:ZET_PROJECT_ROOT"
 }
 if (-not $env:AI_QUEUE_ROOT) {
-    $env:AI_QUEUE_ROOT = Join-Path $HOME "Dropbox\AI_Queue"
+    $env:AI_QUEUE_ROOT = Join-Path $env:USERPROFILE "Dropbox\AI_Queue"
 }
 if (-not $env:FILE_PROXY_SYNC_GRACE_SECONDS) {
     $env:FILE_PROXY_SYNC_GRACE_SECONDS = "300"
@@ -25,10 +25,12 @@ Write-Host "Starting File Proxy..."
 $proxyArgs = @(
     "-m", "file_proxy.cli",
     "--root", $env:AI_QUEUE_ROOT,
-    "--registry-dir", (Join-Path $PSScriptRoot "registries"),
-    "run",
-    "--sync-grace-seconds", $env:FILE_PROXY_SYNC_GRACE_SECONDS
+    "--registry-dir", (Join-Path $PSScriptRoot "registries")
 )
+if ($env:AI_PROXY_RUNTIME_CONFIG) {
+    $proxyArgs += @("--runtime-config", $env:AI_PROXY_RUNTIME_CONFIG)
+}
+$proxyArgs += @("tui", "--sync-grace-seconds", $env:FILE_PROXY_SYNC_GRACE_SECONDS)
 if ($env:AI_PROXY_HTTP_PORT) {
     $proxyArgs += @(
         "--http-listen-host", $(if ($env:AI_PROXY_HTTP_HOST) { $env:AI_PROXY_HTTP_HOST } else { "127.0.0.1" }),
@@ -37,6 +39,12 @@ if ($env:AI_PROXY_HTTP_PORT) {
         "--http-continuation-grace-seconds", $(if ($env:AI_PROXY_HTTP_CONTINUATION_GRACE_SECONDS) { $env:AI_PROXY_HTTP_CONTINUATION_GRACE_SECONDS } else { "2" }),
         "--http-max-body-bytes", $(if ($env:AI_PROXY_HTTP_MAX_BODY_BYTES) { $env:AI_PROXY_HTTP_MAX_BODY_BYTES } else { "104857600" }),
         "--http-upstream-timeout-seconds", $(if ($env:AI_PROXY_HTTP_UPSTREAM_TIMEOUT_SECONDS) { $env:AI_PROXY_HTTP_UPSTREAM_TIMEOUT_SECONDS } else { "7500" })
+    )
+}
+if ($env:AI_PROXY_COMFYUI_PORT) {
+    $proxyArgs += @(
+        "--comfyui-listen-port", $env:AI_PROXY_COMFYUI_PORT,
+        "--comfyui-upstream", $(if ($env:AI_PROXY_COMFYUI_UPSTREAM) { $env:AI_PROXY_COMFYUI_UPSTREAM } else { "http://127.0.0.1:8188" })
     )
 }
 & $venvPython @proxyArgs

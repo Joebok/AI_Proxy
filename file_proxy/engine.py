@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from .models import InvalidJob, JobManifest, JobNotReady, ProxyResult, QueueJob, iso_utc, utc_now
 from .registry import Registry
 from .scheduler import HttpQueue
+from .backend import BackendManager, BackendUnavailable
 from .validation import build_file_inventory, validate_job_folder
 
 
@@ -123,6 +124,8 @@ class Proxy:
         max_resource_streak: int = 5,
         forge_upstream: str | None = None,
         forge_unload_timeout_seconds: float = 30.0,
+        local_runtime_dir: Path | None = None,
+        forge_cleanup_required: bool = False,
     ):
         if max_resource_streak <= 0:
             raise ValueError("max_resource_streak must be positive")
@@ -146,18 +149,21 @@ class Proxy:
         self._resource_streak = 0
         self.forge_upstream = forge_upstream.rstrip("/") if forge_upstream else None
         self.forge_unload_timeout_seconds = forge_unload_timeout_seconds
+        self.forge_cleanup_required = forge_cleanup_required
         self._not_ready_since: dict[Path, float] = {}
         self.ask_root = self.root / "Ask"
         self.running_root = self.root / "Running"
         self.answer_root = self.root / "Answer"
         self.control_root = self.root / "Control"
+        self.local_runtime_dir = (local_runtime_dir or (Path.cwd() / ".ai-proxy-runtime")).resolve()
+        self._filesystem_degraded: str | None = None
 
     def ensure_layout(self) -> None:
         for path in (self.ask_root, self.running_root, self.answer_root, self.control_root):
             path.mkdir(parents=True, exist_ok=True)
 
     def lock(self) -> RuntimeLock:
-        return RuntimeLock(self.control_root / "proxy.lock")
+        return RuntimeLock(self.local_runtime_dir / "proxy.lock")
 
     def _answer_path(self, subscriber_id: str, job_id: str) -> Path:
         return self.answer_root / subscriber_id / job_id
@@ -168,7 +174,16 @@ class Proxy:
         if destination.exists():
             raise RuntimeError(f"answer already exists: {destination}")
         _replace_with_retry(path, destination)
+        self._local_outcome_path(subscriber_id, job_id).unlink(missing_ok=True)
         return destination
+
+    def _local_outcome_path(self, subscriber_id: str, job_id: str) -> Path:
+        return self.local_runtime_dir / "worker-outcomes" / subscriber_id / f"{job_id}.json"
+
+    def _persist_local_outcome(self, subscriber_id: str, job_id: str, payload: dict[str, Any]) -> None:
+        path = self._local_outcome_path(subscriber_id, job_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(path, payload)
 
     def _invalid(self, path: Path, subscriber_id: str, job_id: str, message: str) -> Path:
         self.logger(f"Invalid job {subscriber_id}/{job_id}: {message}")
@@ -197,6 +212,14 @@ class Proxy:
         recovered = 0
         for subscriber_dir in sorted(path for path in self.running_root.iterdir() if path.is_dir()):
             for job_dir in sorted(path for path in subscriber_dir.iterdir() if path.is_dir()):
+                local_outcome = self._local_outcome_path(subscriber_dir.name, job_dir.name)
+                if local_outcome.is_file() and not (job_dir / "proxy_result.json").is_file():
+                    _write_json_atomic(job_dir / "proxy_result.json", json.loads(local_outcome.read_text(encoding="utf-8")))
+                if (job_dir / "proxy_result.json").is_file():
+                    self._move_to_answer(job_dir, subscriber_dir.name, job_dir.name)
+                    self.logger(f"Published previously completed job {subscriber_dir.name}/{job_dir.name}")
+                    recovered += 1
+                    continue
                 started = utc_now()
                 worker = ""
                 try:
@@ -267,12 +290,28 @@ class Proxy:
     def _select_file_job(
         self,
     ) -> QueueJob | tuple[Path, str, str, str] | None:
+        while self._publish_completed_running():
+            pass
         jobs, invalid = self._scan()
         if invalid:
             return invalid[0]
         if not jobs:
             return None
         return self._choose_resource_job(jobs, self._resource_key, self._resource_streak)
+
+    def _publish_completed_running(self) -> bool:
+        if not self.running_root.is_dir():
+            return False
+        for subscriber_dir in sorted(path for path in self.running_root.iterdir() if path.is_dir()):
+            for job_dir in sorted(path for path in subscriber_dir.iterdir() if path.is_dir()):
+                local_outcome = self._local_outcome_path(subscriber_dir.name, job_dir.name)
+                if local_outcome.is_file() and not (job_dir / "proxy_result.json").is_file():
+                    _write_json_atomic(job_dir / "proxy_result.json", json.loads(local_outcome.read_text(encoding="utf-8")))
+                if (job_dir / "proxy_result.json").is_file():
+                    self._move_to_answer(job_dir, subscriber_dir.name, job_dir.name)
+                    self.logger(f"Published completed outcome {subscriber_dir.name}/{job_dir.name}")
+                    return True
+        return False
 
     def _choose_resource_job(
         self,
@@ -307,8 +346,12 @@ class Proxy:
                 status = int(response.status)
             if 200 <= status < 300:
                 self.logger(f"Released Forge checkpoint before {resource_key}")
-        except (urllib.error.URLError, TimeoutError, OSError):
-            pass
+                return
+            raise RuntimeError(f"Forge cleanup returned HTTP {status}")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if self.forge_cleanup_required:
+                self.logger(f"Forge cleanup failed before {resource_key}: {exc}")
+                raise RuntimeError("Forge cleanup failed; unsafe resource transition was blocked") from exc
 
     def _record_resource_key(self, resource_key: str | None) -> None:
         if resource_key is None:
@@ -347,17 +390,23 @@ class Proxy:
         running = self.running_root / manifest.subscriber_id / manifest.job_id
         running.parent.mkdir(parents=True, exist_ok=True)
         _replace_with_retry(queued.path, running)
-        self._prepare_resource(manifest.resource_key)
+        transition_error: str | None = None
+        try:
+            self._prepare_resource(manifest.resource_key)
+        except RuntimeError as exc:
+            transition_error = str(exc)
         self._record_resource_job(manifest)
         next_job_present, next_resource_key = self._next_resource_hint()
         started = utc_now()
-        status = "SUCCEEDED"
+        status = "FAILED" if transition_error else "SUCCEEDED"
         exit_code: int | None = None
-        error_type: str | None = None
-        error_message: str | None = None
+        error_type: str | None = "RESOURCE_TRANSITION" if transition_error else None
+        error_message: str | None = transition_error
         stdout = ""
         stderr = ""
         try:
+            if transition_error:
+                raise BackendUnavailable(transition_error)
             completed = subprocess.run(
                 [*registration.command, "--job-dir", str(running)],
                 shell=False,
@@ -382,6 +431,8 @@ class Proxy:
                 status = "FAILED"
                 error_type = "WORKER_EXIT"
                 error_message = f"Worker exited with code {completed.returncode}."
+        except BackendUnavailable:
+            pass
         except subprocess.TimeoutExpired as exc:
             status = "FAILED"
             error_type = "WORKER_TIMEOUT"
@@ -433,6 +484,7 @@ class Proxy:
             stderr=stderr,
             output_files=output_files,
         )
+        self._persist_local_outcome(manifest.subscriber_id, manifest.job_id, result.to_dict())
         _write_json_atomic(running / "proxy_result.json", result.to_dict())
         answer = self._move_to_answer(running, manifest.subscriber_id, manifest.job_id)
         self.logger(
@@ -452,17 +504,26 @@ class Proxy:
         http_queue: HttpQueue,
         poll_seconds: float = 1.0,
         continuation_grace_seconds: float = 2.0,
+        backend_manager: BackendManager | None = None,
+        ollama_upstream: str | None = None,
     ) -> None:
         last_http_completed: float | None = None
         loop = asyncio.get_running_loop()
         while True:
             http_job = http_queue.pop()
             if http_job is not None:
-                await asyncio.to_thread(self._prepare_resource, http_job.resource_key)
-                self._record_resource_key(http_job.resource_key)
+                try:
+                    if backend_manager:
+                        await backend_manager.prepare_for(http_job.backend, ollama_upstream=ollama_upstream, job_id=http_job.request_id)
+                    await asyncio.to_thread(self._prepare_resource, http_job.resource_key)
+                    self._record_resource_key(http_job.resource_key)
+                except (BackendUnavailable, RuntimeError) as exc:
+                    http_job.start_error = str(exc)
                 if not http_job.started.done():
                     http_job.started.set_result(None)
                 await http_job.finished
+                if backend_manager:
+                    await backend_manager.released(http_job.backend)
                 last_http_completed = loop.time()
                 continue
 
@@ -473,24 +534,56 @@ class Proxy:
                     continue
                 last_http_completed = None
 
-            selected = await asyncio.to_thread(self._select_file_job)
+            try:
+                selected = await asyncio.to_thread(self._select_file_job)
+                self._filesystem_degraded = None
+            except OSError as exc:
+                self._filesystem_degraded = str(exc)
+                self.logger(f"Filesystem queue unavailable; API listeners remain active: {exc}")
+                await http_queue.wait(poll_seconds)
+                continue
             if http_queue.has_waiting():
                 continue
             if selected is None:
                 await http_queue.wait(poll_seconds)
                 continue
+            file_backend = None
+            if isinstance(selected, QueueJob):
+                registration = self.registry.worker(selected.manifest.subscriber_id, selected.manifest.worker)
+                file_backend = registration.backend if registration else None
+                if file_backend is None and selected.manifest.resource_key:
+                    prefix = selected.manifest.resource_key.split(":", 1)[0]
+                    file_backend = prefix if prefix in {"ollama", "comfyui"} else None
+            if backend_manager and backend_manager.config.enabled and file_backend is None:
+                self.logger("Filesystem worker is held: managed mode requires a trusted backend declaration")
+                await http_queue.wait(poll_seconds)
+                continue
+            if backend_manager:
+                try:
+                    file_job_id = selected.manifest.job_id if isinstance(selected, QueueJob) else None
+                    await backend_manager.prepare_for(file_backend, ollama_upstream=ollama_upstream, job_id=file_job_id)
+                except BackendUnavailable as exc:
+                    self.logger(f"Filesystem worker is held: {exc}")
+                    await http_queue.wait(poll_seconds)
+                    continue
             worker_task = asyncio.create_task(asyncio.to_thread(self._process_file_job, selected))
             try:
                 await asyncio.shield(worker_task)
+            except OSError as exc:
+                self._filesystem_degraded = str(exc)
+                self.logger(f"Filesystem processing degraded: {exc}")
             except asyncio.CancelledError:
                 await worker_task
                 raise
+            finally:
+                if backend_manager:
+                    await backend_manager.released(file_backend)
 
     def run(self, poll_seconds: float = 1.0) -> None:
         self.ensure_layout()
         self.logger(f"Queue root: {self.root}")
         with self.lock():
-            self.logger(f"Lock acquired: {self.control_root / 'proxy.lock'}")
+            self.logger(f"Lock acquired: {self.local_runtime_dir / 'proxy.lock'}")
             recovered = self.recover_interrupted()
             if recovered:
                 self.logger(f"Recovered {recovered} interrupted job(s)")
@@ -512,7 +605,10 @@ class Proxy:
             return self.process_once()
 
     def status(self, subscriber: str | None = None, job: str | None = None) -> dict[str, Any]:
-        self.ensure_layout()
+        try:
+            self.ensure_layout()
+        except OSError as exc:
+            return {"counts": {}, "jobs": [], "degraded": str(exc)}
         counts = {"queued": 0, "running": 0, "succeeded": 0, "failed": 0, "invalid": 0}
         items: list[dict[str, str]] = []
         for state, root in (("queued", self.ask_root), ("running", self.running_root), ("answer", self.answer_root)):
@@ -531,4 +627,4 @@ class Proxy:
                             item_state = "failed"
                     counts[item_state] += 1
                     items.append({"subscriber_id": subscriber_dir.name, "job_id": job_dir.name, "status": item_state})
-        return {"counts": counts, "jobs": items}
+        return {"counts": counts, "jobs": items, "degraded": self._filesystem_degraded}

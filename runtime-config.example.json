@@ -1,0 +1,32 @@
+{
+  "runtime_dir": "C:\\Users\\Joe\\AppData\\Local\\AI_Proxy",
+  "managed_comfyui": {
+    "enabled": false,
+    "executable": "D:\\Comfy-Desktop\\ComfyUI\\ComfyUI\\.venv\\Scripts\\python.exe",
+    "script": "D:\\Comfy-Desktop\\ComfyUI\\ComfyUI\\main.py",
+    "arguments": [
+      "--listen", "127.0.0.1",
+      "--port", "8188",
+      "--input-directory", "D:\\Comfy-Desktop\\ComfyUI-Shared\\input",
+      "--output-directory", "D:\\Comfy-Desktop\\ComfyUI-Shared\\output",
+      "--disable-auto-launch",
+      "--enable-manager"
+    ],
+    "working_directory": "D:\\Comfy-Desktop\\ComfyUI\\ComfyUI",
+    "model_config": "C:\\Users\\Joe\\AppData\\Roaming\\Comfy Desktop\\shared_model_paths.yaml",
+    "upstream": "http://127.0.0.1:8188",
+    "startup_deadline_seconds": 180,
+    "startup_cooldown_seconds": 30,
+    "idle_shutdown_seconds": 60,
+    "shutdown_deadline_seconds": 15
+  },
+  "generation_settlement_seconds": 7500,
+  "cancellation_grace_seconds": 30,
+  "queue_wait_seconds": 1800,
+  "max_admitted_requests": 32,
+  "max_buffered_body_bytes": 268435456,
+  "retention_days": 7,
+  "cache_max_bytes": 10737418240,
+  "max_resource_streak": 5,
+  "oldest_request_seconds": 60
+}

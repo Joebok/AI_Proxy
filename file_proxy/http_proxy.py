@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import hashlib
 import json
+import os
+from pathlib import Path
 import socket
+import zlib
 from typing import TYPE_CHECKING
 import uuid
 from urllib.parse import urlsplit
@@ -13,6 +17,9 @@ from aiohttp import web
 from multidict import CIMultiDict
 
 from .scheduler import HttpQueue
+from .backend import BackendManager, BackendUnavailable
+from .store import ExecutionStore
+from .runtime import RuntimeConfig
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -83,11 +90,16 @@ COMFYUI_SETTLE_ROUTES = frozenset(
 
 
 def _is_valid_prompt_id(value: object) -> bool:
-    return isinstance(value, str) and 1 <= len(value) <= 128 and value.strip() != ""
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value.lower()
+    except ValueError:
+        return False
 
 
-def _workflow_checkpoint(body: bytes) -> str | None:
-    """First non-empty ``ckpt_name`` across the workflow's node input dicts."""
+def _workflow_signature(body: bytes) -> str | None:
+    """Stable signature from recognized ComfyUI model-loader inputs."""
     if not isinstance(body, (bytes, bytearray)):
         return None
     try:
@@ -97,16 +109,19 @@ def _workflow_checkpoint(body: bytes) -> str | None:
     workflow = payload.get("prompt") if isinstance(payload, dict) else None
     if not isinstance(workflow, dict):
         return None
-    for node in workflow.values():
+    recognized = ("ckpt_name", "unet_name", "diffusion_model", "clip_name", "clip_name1", "clip_name2", "vae_name", "lora_name")
+    values: list[str] = []
+    for node_id, node in sorted(workflow.items(), key=lambda item: str(item[0])):
         if not isinstance(node, dict):
             continue
         inputs = node.get("inputs")
         if not isinstance(inputs, dict):
             continue
-        value = inputs.get("ckpt_name")
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
+        for key in recognized:
+            value = inputs.get(key)
+            if isinstance(value, str) and value.strip():
+                values.append(f"{key}={value.strip()}")
+    return "|".join(values) or None
 
 
 def request_resource_key(method: str, path: str, body: bytes) -> str | None:
@@ -123,18 +138,13 @@ def request_resource_key(method: str, path: str, body: bytes) -> str | None:
 def comfyui_resource_key(method: str, path: str, body: bytes) -> str | None:
     if (method, path) not in COMFYUI_QUEUE_ROUTES:
         return None
-    model = _workflow_checkpoint(body)
-    return f"comfyui:{model}" if model else None
+    signature = _workflow_signature(body)
+    return f"comfyui:{signature}" if signature else "comfyui"
 
 
 def _is_valid_upstream_prompt_id(value: object) -> bool:
     """A valid *returned* prompt_id: a local opaque string, never a URL."""
-    if not _is_valid_prompt_id(value):
-        return False
-    split = urlsplit(value)
-    if split.scheme not in {"", "http", "https"} or split.hostname:
-        return False
-    return True
+    return _is_valid_prompt_id(value)
 
 
 @dataclass(frozen=True)
@@ -175,6 +185,10 @@ class HttpProxyConfig:
     bypass_routes: frozenset[tuple[str, str]] = field(default_factory=lambda: DEFAULT_BYPASS_ROUTES)
     profile: BackendProfile = OLLAMA_PROFILE
     settle_poll_seconds: float = 1.0
+    queue_wait_seconds: float = 1800.0
+    max_admitted_requests: int = 32
+    max_buffered_body_bytes: int = 256 * 1024 * 1024
+    cancellation_grace_seconds: float = 30.0
 
     def validate(self) -> None:
         if not 1 <= self.listen_port <= 65535:
@@ -192,6 +206,8 @@ class HttpProxyConfig:
             raise ValueError("HTTP upstream timeout seconds must be positive")
         if self.settle_poll_seconds <= 0:
             raise ValueError("HTTP settle poll seconds must be positive")
+        if self.queue_wait_seconds <= 0 or self.max_admitted_requests <= 0 or self.max_buffered_body_bytes <= 0:
+            raise ValueError("HTTP admission limits must be positive")
         if self.profile.name not in _PROFILE_NAMES:
             raise ValueError(f"unknown backend profile {self.profile.name!r}")
         upstream_port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -251,12 +267,14 @@ def _prepare_prompt_id(body: bytes, method: str, path: str) -> tuple[bytes, str 
         payload = json.loads(bytes(body))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return bytes(body), None, False
-    if not isinstance(payload, dict) or not _is_valid_upstream_prompt_id(payload.get("prompt")):
+    if not isinstance(payload, dict) or not isinstance(payload.get("prompt"), dict):
         return bytes(body), None, False
     supplied = payload.get("prompt_id")
-    if _is_valid_upstream_prompt_id(supplied):
-        return bytes(body), supplied, False
-    payload["prompt_id"] = uuid.uuid4().hex
+    if supplied is not None:
+        if _is_valid_upstream_prompt_id(supplied):
+            return bytes(body), supplied, False
+        raise ValueError("prompt_id must be a canonical UUID")
+    payload["prompt_id"] = str(uuid.uuid4())
     try:
         return json.dumps(payload, separators=(",", ":")).encode(), payload["prompt_id"], True
     except (TypeError, ValueError, UnicodeEncodeError):
@@ -268,12 +286,61 @@ def _history_path(path: str) -> str:
     return "/api/history" if path == "/api/prompt" else "/history"
 
 
+class AdmissionController:
+    def __init__(self, max_requests: int, max_bytes: int) -> None:
+        self.max_requests = max_requests
+        self.max_bytes = max_bytes
+        self.requests = 0
+        self.bytes = 0
+        self._lock = asyncio.Lock()
+
+    async def enter(self) -> None:
+        async with self._lock:
+            if self.requests >= self.max_requests:
+                raise web.HTTPServiceUnavailable(text="AI Proxy admission capacity is full", headers={"Retry-After": "5"})
+            self.requests += 1
+
+    async def add(self, amount: int) -> None:
+        async with self._lock:
+            if self.bytes + amount > self.max_bytes:
+                raise web.HTTPServiceUnavailable(text="AI Proxy buffered-body capacity is full", headers={"Retry-After": "5"})
+            self.bytes += amount
+
+    async def leave(self, amount: int) -> None:
+        async with self._lock:
+            self.requests = max(0, self.requests - 1)
+            self.bytes = max(0, self.bytes - amount)
+
+    async def release_bytes(self, amount: int) -> None:
+        async with self._lock:
+            self.bytes = max(0, self.bytes - amount)
+
+
+@dataclass
+class HttpRuntimeState:
+    """Live HTTP runtime objects exposed to an in-process dashboard."""
+
+    listener_states: dict[str, str] = field(default_factory=dict)
+    queue: HttpQueue | None = None
+    services: list["HttpProxyService"] = field(default_factory=list)
+    backend_manager: BackendManager | None = None
+    store: ExecutionStore | None = None
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+
+
 class HttpProxyService:
     def __init__(
         self,
         config: HttpProxyConfig,
         queue: HttpQueue,
         logger: Callable[[str], None],
+        *,
+        admission: AdmissionController | None = None,
+        store: ExecutionStore | None = None,
+        backend_manager: BackendManager | None = None,
+        status_provider: Callable[[], dict[str, object]] | None = None,
+        retention_days: int = 7,
+        cache_max_bytes: int = 10 * 1024 * 1024 * 1024,
     ) -> None:
         config.validate()
         self.config = config
@@ -283,11 +350,25 @@ class HttpProxyService:
         self._upstream = config.upstream.rstrip("/")
         self._session: aiohttp.ClientSession | None = None
         self._runner: web.AppRunner | None = None
+        self._site: web.TCPSite | None = None
         self._lifecycle_tasks: set[asyncio.Task[None]] = set()
+        self.admission = admission or AdmissionController(config.max_admitted_requests, config.max_buffered_body_bytes)
+        self.store = store
+        self.backend_manager = backend_manager
+        self.status_provider = status_provider
+        self.retention_days = retention_days
+        self.cache_max_bytes = cache_max_bytes
+        self._cache_error: str | None = None
 
     def _route_is_queued(self, route: tuple[str, str]) -> bool:
         if self.profile.queue_all_except_bypass:
             return route not in self.config.bypass_routes
+        if self.backend_manager and self.backend_manager.config.enabled:
+            return (
+                route not in {("POST", "/interrupt"), ("POST", "/api/interrupt")}
+                and route[1] != "/ws"
+                and not route[1].startswith("/_proxy/")
+            )
         return route in self.profile.queue_routes
 
     def _route_is_settle(self, route: tuple[str, str]) -> bool:
@@ -301,11 +382,14 @@ class HttpProxyService:
         self._runner = web.AppRunner(app, access_log=None, handler_cancellation=True)
         try:
             await self._runner.setup()
-            site = web.TCPSite(self._runner, self.config.listen_host, self.config.listen_port)
-            await site.start()
+            self._site = web.TCPSite(
+                self._runner, self.config.listen_host, self.config.listen_port
+            )
+            await self._site.start()
         except BaseException:
             await self._runner.cleanup()
             await self._session.close()
+            self._site = None
             self._runner = None
             self._session = None
             raise
@@ -316,29 +400,81 @@ class HttpProxyService:
         )
 
     async def stop(self) -> None:
-        self.queue.close()
+        await self.stop_accepting()
         tasks = list(self._lifecycle_tasks)
-        for task in tasks:
-            task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            if self.profile.name == "comfyui" and self._session:
+                try:
+                    async with self._session.post(f"{self._upstream}/interrupt"):
+                        pass
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                    pass
+            _done, pending = await asyncio.wait(tasks, timeout=self.config.cancellation_grace_seconds)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
         self._lifecycle_tasks.clear()
         if self._runner is not None:
             await self._runner.cleanup()
+            self._runner = None
         if self._session is not None:
             await self._session.close()
+            self._session = None
+
+    async def stop_accepting(self) -> None:
+        """Close admission and listening sockets while active work winds down."""
+
+        self.queue.close()
+        if self._site is not None:
+            await self._site.stop()
+            self._site = None
+
+    async def reconcile_records(self) -> None:
+        if not self.store:
+            return
+        for record in self.store.pending():
+            prompt_id = record.get("prompt_id")
+            if record.get("backend") == "ollama":
+                continue
+            if record.get("backend") != "comfyui" or not isinstance(prompt_id, str):
+                self.store.update(record["request_id"], "failed", outcome="restart", error="ambiguous execution after proxy restart")
+                continue
+            history = await self._wait_for_prompt_completion(prompt_id, "/prompt", timeout=0.25)
+            if history is not None:
+                await self._archive_completion(record["request_id"], prompt_id, history)
+            elif self.backend_manager and self.backend_manager.config.enabled:
+                self.store.update(record["request_id"], "failed", outcome="restart", error="owned backend ended with previous proxy")
+            elif self.backend_manager:
+                self.backend_manager.block(f"Prompt {prompt_id} was unresolved at restart; reconcile it before GPU execution")
+                self.store.update(record["request_id"], "blocked", outcome="unresolved", error=self.backend_manager.blocked_reason)
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
-        body = await request.read()
         route = (request.method, request.path)
+        special = await self._special_route(request)
+        if special is not None:
+            return special
         if not self._route_is_queued(route):
+            body = await self._read_body(request, admitted=False)
             return await self._relay(request, body, None)
+
+        buffered = 0
+        await self.admission.enter()
+        try:
+            body = await self._read_body(request, admitted=True)
+            buffered = len(body)
+        except BaseException:
+            await self.admission.leave(0)
+            raise
 
         try:
             job = self.queue.enqueue(
-                self.profile.resource_key_fn(request.method, request.path, body)
+                self.profile.resource_key_fn(request.method, request.path, body),
+                backend=self.profile.name,
+                barrier=route in {("POST", "/queue"), ("POST", "/api/queue"), ("POST", "/history"), ("POST", "/api/history")},
             )
         except RuntimeError:
+            await self.admission.leave(buffered)
             raise web.HTTPServiceUnavailable(text="AI Proxy is shutting down") from None
         self.logger(f"Queued {self.profile.name} HTTP request {job.request_id}: {request.method} {request.path}")
         if self._route_is_settle(route):
@@ -349,7 +485,7 @@ class HttpProxyService:
             # release the slot early.
             response = asyncio.get_running_loop().create_future()
             lifecycle = asyncio.create_task(
-                self._run_prompt_lifecycle(request, job, response, body),
+                self._run_prompt_lifecycle(request, job, response, body, buffered),
                 name=f"prompt-lifecycle-{job.request_id}",
             )
             self._lifecycle_tasks.add(lifecycle)
@@ -357,18 +493,57 @@ class HttpProxyService:
             try:
                 return await response
             except asyncio.CancelledError:
-                # The lifecycle keeps running and owns job.finished.
+                if not job.dispatched:
+                    self.queue.cancel(job)
+                    lifecycle.cancel()
                 raise
         resource_tag = f"[{job.resource_key}] " if job.resource_key else ""
         try:
-            await job.started
+            try:
+                await asyncio.wait_for(asyncio.shield(job.started), self.config.queue_wait_seconds)
+            except asyncio.TimeoutError:
+                self.queue.cancel(job)
+                raise web.HTTPGatewayTimeout(text="AI Proxy queue wait expired") from None
             if job.cancelled or self.queue.closed:
                 raise web.HTTPServiceUnavailable(text="AI Proxy is shutting down")
+            if job.start_error:
+                raise web.HTTPServiceUnavailable(text=job.start_error, headers={"Retry-After": "30"})
             self.logger(
                 f"{resource_tag}Starting {self.profile.name} HTTP request {job.request_id}: "
                 f"{request.method} {request.path}"
             )
-            return await self._relay(request, body, job.request_id)
+            track_ollama = self.store is not None and self.profile.name == "ollama" and route in MODEL_ROUTES
+            if track_ollama:
+                self.store.create(job.request_id, self.profile.name, None)
+                self.store.update(job.request_id, "dispatched")
+            try:
+                relayed = await self._relay(request, body, job.request_id)
+            except (aiohttp.ClientError, web.HTTPBadGateway, web.HTTPGatewayTimeout) as exc:
+                if track_ollama:
+                    if self.backend_manager:
+                        try:
+                            await self.backend_manager.reconcile_ollama(self._upstream)
+                        except BackendUnavailable as reconcile_exc:
+                            self.store.update(job.request_id, "blocked", outcome="unresolved", error=str(reconcile_exc))
+                            self.backend_manager.block("Ollama execution failed ambiguously; unload/reconciliation is required")
+                        else:
+                            self.store.update(job.request_id, "failed", outcome="reconciled", error=str(exc))
+                    else:
+                        self.store.update(job.request_id, "blocked", outcome="unresolved", error=str(exc))
+                raise
+            if track_ollama:
+                self.store.update(job.request_id, "completed", outcome="succeeded")
+            if self.store and relayed.status < 300 and route in {("POST", "/history"), ("POST", "/api/history")}:
+                try:
+                    payload = json.loads(body or b"{}")
+                    prompt_ids = payload.get("delete") if isinstance(payload, dict) else None
+                    if isinstance(prompt_ids, list) and all(isinstance(value, str) for value in prompt_ids):
+                        self.store.delete_history(prompt_ids)
+                    elif isinstance(payload, dict) and payload.get("clear") is True:
+                        self.store.delete_history()
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+            return relayed
         except asyncio.CancelledError:
             self.queue.cancel(job)
             raise
@@ -377,6 +552,64 @@ class HttpProxyService:
                 self.queue.finish(job)
             else:
                 self.queue.cancel(job)
+            await self.admission.leave(buffered)
+
+    async def _read_body(self, request: web.Request, *, admitted: bool) -> bytes:
+        declared = request.content_length
+        if declared is not None and declared > self.config.max_body_bytes:
+            raise web.HTTPRequestEntityTooLarge(max_size=self.config.max_body_bytes, actual_size=declared)
+        chunks: list[bytes] = []
+        total = 0
+        reserved = 0
+        try:
+            async for chunk in request.content.iter_chunked(64 * 1024):
+                total += len(chunk)
+                if total > self.config.max_body_bytes:
+                    raise web.HTTPRequestEntityTooLarge(max_size=self.config.max_body_bytes, actual_size=total)
+                if admitted:
+                    await self.admission.add(len(chunk))
+                    reserved += len(chunk)
+                chunks.append(chunk)
+        except BaseException:
+            if admitted:
+                await self.admission.release_bytes(reserved)
+            raise
+        return b"".join(chunks)
+
+    async def _special_route(self, request: web.Request) -> web.StreamResponse | None:
+        if request.method == "GET" and request.path == "/_proxy/status":
+            data: dict[str, object] = {"backend": self.profile.name, "queue": self.queue.snapshot()}
+            if self.backend_manager:
+                data["backend_runtime"] = self.backend_manager.status()
+            if self.store:
+                data["cache"] = {**self.store.status(), "error": self._cache_error}
+            if self.status_provider:
+                data["filesystem"] = self.status_provider()
+            return web.json_response(data)
+        if request.method == "GET" and request.path.startswith("/_proxy/jobs/"):
+            record = self.store.get(request.path.rsplit("/", 1)[-1]) if self.store else None
+            if not record:
+                raise web.HTTPNotFound(text="unknown request id")
+            record.pop("history_json", None)
+            return web.json_response(record)
+        if request.method == "GET" and self.store:
+            if request.path in {"/history", "/api/history"} and self.backend_manager and self.backend_manager.config.enabled:
+                return web.Response(body=self.store.histories(), content_type="application/json")
+            prefix = "/api/history/" if request.path.startswith("/api/history/") else "/history/"
+            if request.path.startswith(prefix):
+                prompt_id = request.path[len(prefix):]
+                cached = self.store.history(prompt_id)
+                if cached is not None:
+                    return web.Response(body=cached, content_type="application/json")
+            if request.path in {"/view", "/api/view"}:
+                filename = request.query.get("filename", "")
+                subfolder = request.query.get("subfolder", "")
+                kind = request.query.get("type", "output")
+                prompt_id = request.query.get("prompt_id")
+                cached_path = self.store.artifact(prompt_id, filename, subfolder, kind)
+                if cached_path:
+                    return web.FileResponse(cached_path)
+        return None
 
     async def _run_prompt_lifecycle(
         self,
@@ -384,6 +617,7 @@ class HttpProxyService:
         job: HttpJob,
         response: asyncio.Future[web.StreamResponse],
         body: bytes,
+        buffered: int,
     ) -> None:
         """Settle-route lifecycle that holds the slot until the prompt settles.
 
@@ -395,17 +629,45 @@ class HttpProxyService:
         """
         profile = self.profile
         started = False
+        known_id: str | None = None
+        dispatched = False
         try:
-            await job.started
+            try:
+                await asyncio.wait_for(asyncio.shield(job.started), self.config.queue_wait_seconds)
+            except asyncio.TimeoutError:
+                self.queue.cancel(job)
+                if not response.done():
+                    response.set_exception(web.HTTPGatewayTimeout(text="AI Proxy queue wait expired"))
+                return
             started = True
             if job.cancelled or self.queue.closed:
                 self.logger(
                     f"{profile.name} HTTP request {job.request_id} cancelled before dispatch"
                 )
+                if not response.done():
+                    response.set_exception(web.HTTPServiceUnavailable(text="AI Proxy is shutting down"))
                 return
-            forwarded_body, known_id, body_changed = _prepare_prompt_id(
-                body, request.method, request.path
-            )
+            if job.start_error:
+                if not response.done():
+                    response.set_exception(web.HTTPServiceUnavailable(text=job.start_error, headers={"Retry-After": "30"}))
+                return
+            try:
+                forwarded_body, known_id, body_changed = _prepare_prompt_id(body, request.method, request.path)
+            except ValueError as exc:
+                if not response.done():
+                    response.set_exception(web.HTTPBadRequest(text=str(exc)))
+                return
+            if known_id is None:
+                if not response.done():
+                    response.set_exception(web.HTTPBadRequest(text="ComfyUI prompt must contain a workflow object"))
+                return
+            if self.store:
+                try:
+                    self.store.create(job.request_id, profile.name, known_id)
+                except FileExistsError:
+                    if not response.done():
+                        response.set_exception(web.HTTPConflict(text="prompt_id is already tracked"))
+                    return
             headers = _forward_headers(request.headers, request=True)
             if body_changed:
                 headers = [
@@ -413,9 +675,13 @@ class HttpProxyService:
                     for name, value in headers
                     if name.casefold() != "content-length"
                 ]
-            dispatched = False
             downstream: web.StreamResponse | None = None
+            settlement_deadline = asyncio.get_running_loop().time() + self.config.upstream_timeout_seconds
             try:
+                dispatched = True
+                job.dispatched = True
+                if self.store:
+                    self.store.update(job.request_id, "dispatched")
                 async with self._session.request(
                     request.method,
                     f"{self._upstream}{request.raw_path}",
@@ -423,21 +689,24 @@ class HttpProxyService:
                     data=forwarded_body,
                     allow_redirects=False,
                 ) as upstream:
-                    dispatched = True
                     status = upstream.status
-                    upstream_body = await upstream.content.read()
+                    wire_body = await _read_bounded(upstream.content, self.config.max_body_bytes)
+                    upstream_body = _decode_body(wire_body, upstream.headers.get("Content-Encoding"), self.config.max_body_bytes)
                     if 200 <= status < 300:
                         returned_id = _extract_prompt_id(upstream_body)
-                        if returned_id is None:
-                            known_id = None
-                        elif known_id is not None and returned_id != known_id:
+                        if returned_id is not None and returned_id != known_id:
                             self.logger(
                                 f"{profile.name} upstream returned prompt id {returned_id} "
                                 f"different from preassigned {known_id}; tracking the returned id"
                             )
                             known_id = returned_id
+                            if self.store:
+                                try:
+                                    self.store.reconcile_prompt_id(job.request_id, returned_id)
+                                except FileExistsError:
+                                    raise web.HTTPConflict(text="upstream returned an already tracked prompt_id") from None
                         else:
-                            known_id = returned_id
+                            known_id = returned_id or known_id
                     header_pairs = _forward_headers(upstream.headers, request=False)
                     header_pairs = [
                         (name, value)
@@ -453,7 +722,7 @@ class HttpProxyService:
                         await downstream.prepare(request)
                         await downstream.write(upstream_body)
                         await downstream.write_eof()
-                        if not response.cancelled():
+                        if not response.done():
                             response.set_result(downstream)
                     except BaseException:
                         # The client disconnected mid-delivery; the lifecycle still
@@ -464,78 +733,195 @@ class HttpProxyService:
                             pass
                     self.logger(f"Finished {profile.name} HTTP request {job.request_id}: {status}")
                     if 200 <= status < 300 and known_id:
-                        settled = await self._wait_for_prompt_completion(known_id, request.path)
-                        if not settled:
-                            self.logger(
-                                f"{profile.name} prompt {known_id} did not settle "
-                                "before the settle deadline"
-                            )
+                        remaining = max(0.0, settlement_deadline - asyncio.get_running_loop().time())
+                        history = await self._wait_for_prompt_completion(known_id, request.path, timeout=remaining)
+                        if history is not None:
+                            await self._archive_completion(job.request_id, known_id, history)
+                        else:
+                            await self._cancel_and_reconcile(job.request_id, known_id, request.path)
+                    elif self.store:
+                        self.store.update(job.request_id, "failed", outcome="rejected", error=f"upstream status {status}")
             except asyncio.TimeoutError:
                 self.logger(
                     f"{profile.name} upstream failed for request {job.request_id}"
                     + ("; reconciling by prompt id" if dispatched and known_id else "")
                 )
                 if dispatched and known_id:
-                    try:
-                        await self._wait_for_prompt_completion(known_id, request.path)
-                    except asyncio.CancelledError:
-                        raise
-                if not response.cancelled():
+                    remaining = max(0.0, settlement_deadline - asyncio.get_running_loop().time())
+                    history = await self._wait_for_prompt_completion(known_id, request.path, timeout=remaining)
+                    if history is not None:
+                        await self._archive_completion(job.request_id, known_id, history)
+                    else:
+                        await self._cancel_and_reconcile(job.request_id, known_id, request.path)
+                if not response.done():
                     response.set_exception(
-                        web.HTTPGatewayTimeout("upstream timed out")
+                        web.HTTPGatewayTimeout(text="upstream timed out")
                     )
-            except (aiohttp.ClientError, ConnectionError, OSError):
+            except (aiohttp.ClientError, ConnectionError, OSError, web.HTTPException):
                 self.logger(
                     f"{profile.name} upstream failed for request {job.request_id}"
                     + ("; reconciling by prompt id" if dispatched and known_id else "")
                 )
                 if dispatched and known_id:
-                    try:
-                        await self._wait_for_prompt_completion(known_id, request.path)
-                    except asyncio.CancelledError:
-                        raise
+                    remaining = max(0.0, settlement_deadline - asyncio.get_running_loop().time())
+                    history = await self._wait_for_prompt_completion(known_id, request.path, timeout=remaining)
+                    if history is not None:
+                        await self._archive_completion(job.request_id, known_id, history)
+                    else:
+                        await self._cancel_and_reconcile(job.request_id, known_id, request.path)
                 if downstream is not None:
                     try:
                         downstream.force_close()
                     except Exception:
                         pass
                 else:
-                    if not response.cancelled():
+                    if not response.done():
                         response.set_exception(
-                            web.HTTPBadGateway("upstream request failed")
+                            web.HTTPBadGateway(text="upstream request failed")
                         )
+        except asyncio.CancelledError:
+            if self.store and dispatched:
+                self.store.update(job.request_id, "failed", outcome="shutdown", error="proxy stopped during reconciliation")
+            if not response.done():
+                response.cancel()
+            raise
         except Exception as exc:
-            if not response.cancelled():
+            if not response.done():
                 response.set_exception(exc)
         finally:
             if started and not job.finished.done():
                 self.queue.finish(job)
+            await self.admission.leave(buffered)
 
-    async def _wait_for_prompt_completion(self, prompt_id: str, path: str) -> bool:
+    async def _wait_for_prompt_completion(self, prompt_id: str, path: str, *, timeout: float | None = None) -> bytes | None:
         """Poll upstream history until prompt_id has a terminal entry.
 
         Bounded by a single explicit deadline of ``upstream_timeout_seconds``.
-        Returns True once a parsed ``{prompt_id: {...}}`` entry exists; any
+        Returns the decoded history once a parsed ``{prompt_id: {...}}`` entry exists; any
         terminal entry (including errors or interruptions) frees the GPU.
         """
         assert self._session is not None
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.config.upstream_timeout_seconds
+        deadline = loop.time() + (timeout if timeout is not None else self.config.upstream_timeout_seconds)
         url = f"{self._upstream}{_history_path(path)}/{prompt_id}"
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
-                return False
-            entry = False
+                return None
             try:
-                async with self._session.get(url) as history:
+                request_timeout = aiohttp.ClientTimeout(total=max(0.05, remaining))
+                async with self._session.get(url, timeout=request_timeout) as history:
                     if 200 <= history.status < 300:
-                        entry = self._parse_terminal_entry(await history.content.read(), prompt_id)
-            except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError, OSError):
-                entry = False
-            if entry:
-                return True
+                        wire = await _read_bounded(history.content, self.config.max_body_bytes)
+                        body = _decode_body(wire, history.headers.get("Content-Encoding"), self.config.max_body_bytes)
+                        if self._parse_terminal_entry(body, prompt_id):
+                            return body
+            except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError, OSError, web.HTTPException):
+                pass
             await asyncio.sleep(min(self.config.settle_poll_seconds, remaining))
+
+    async def _cancel_and_reconcile(self, request_id: str, prompt_id: str, path: str) -> None:
+        assert self._session is not None
+        if self.store:
+            self.store.update(request_id, "cancelling", error="generation settlement deadline expired")
+        try:
+            async with self._session.post(f"{self._upstream}/interrupt") as interrupt:
+                if interrupt.status >= 300:
+                    self.logger(f"ComfyUI cancellation returned HTTP {interrupt.status}")
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            self.logger(f"ComfyUI cancellation failed: {exc}")
+        history = await self._wait_for_prompt_completion(
+            prompt_id, path, timeout=self.config.cancellation_grace_seconds
+        )
+        if history is not None:
+            await self._archive_completion(request_id, prompt_id, history)
+            return
+        if self.backend_manager and self.backend_manager.config.enabled and self.backend_manager.ownership == "proxy":
+            await self.backend_manager.stop_comfyui()
+            if self.store:
+                self.store.update(request_id, "failed", outcome="terminated", error="backend terminated after cancellation grace")
+            return
+        if self.store:
+            self.store.update(request_id, "blocked", outcome="unresolved", error="external backend did not settle; intervention required")
+        self.logger(f"ComfyUI prompt {prompt_id} is unresolved; external GPU execution remains blocked")
+        # Never free an external, unresolved GPU slot. Service shutdown cancels this wait.
+        await asyncio.Event().wait()
+
+    async def _archive_completion(self, request_id: str, prompt_id: str, history_body: bytes) -> None:
+        if not self.store:
+            return
+        try:
+            self.store.evict(self.retention_days, self.cache_max_bytes)
+            payload = json.loads(history_body)
+            entry = payload[prompt_id]
+            status = entry.get("status", {}) if isinstance(entry, dict) else {}
+            upstream_succeeded = (
+                isinstance(status, dict)
+                and status.get("completed") is True
+                and status.get("status_str") in {"success", "succeeded"}
+            )
+            outputs = entry.get("outputs", {})
+            if not isinstance(outputs, dict):
+                raise ValueError("history outputs are not an object")
+            artifacts: list[dict[str, str]] = []
+            for node in outputs.values():
+                if not isinstance(node, dict):
+                    continue
+                for value in node.values():
+                    if not isinstance(value, list):
+                        continue
+                    for item in value:
+                        if not isinstance(item, dict) or "filename" not in item:
+                            continue
+                        filename = item.get("filename")
+                        subfolder = item.get("subfolder", "")
+                        kind = item.get("type", "output")
+                        if not all(isinstance(part, str) for part in (filename, subfolder, kind)) or kind not in {"output", "temp"}:
+                            raise ValueError("unsupported ComfyUI artifact reference")
+                        artifacts.append({"filename": filename, "subfolder": subfolder, "type": kind})
+            for artifact in artifacts:
+                await self._archive_artifact(prompt_id, artifact)
+            self.store.update(
+                request_id,
+                "completed" if upstream_succeeded else "failed",
+                outcome="succeeded" if upstream_succeeded else "upstream_error",
+                history=history_body,
+                error=None if upstream_succeeded else str(status.get("status_str") or "ComfyUI execution failed"),
+            )
+            self.store.evict(self.retention_days, self.cache_max_bytes)
+            self._cache_error = None
+        except (OSError, ValueError, KeyError, json.JSONDecodeError, aiohttp.ClientError) as exc:
+            self._cache_error = str(exc)
+            self.store.update(request_id, "failed", outcome="archive_failed", error=str(exc))
+            raise BackendUnavailable(f"Could not preserve ComfyUI result: {exc}") from exc
+
+    async def _archive_artifact(self, prompt_id: str, artifact: dict[str, str]) -> None:
+        assert self._session is not None and self.store is not None
+        params = {"filename": artifact["filename"], "subfolder": artifact["subfolder"], "type": artifact["type"]}
+        safe_name = Path(artifact["filename"]).name
+        if safe_name != artifact["filename"] or not safe_name:
+            raise ValueError("unsafe artifact filename")
+        target_dir = self.store.cache_dir / prompt_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        cache_key = hashlib.sha256(f"{artifact['type']}\0{artifact['subfolder']}\0{artifact['filename']}".encode()).hexdigest()[:16]
+        target = target_dir / f"{cache_key}-{safe_name}"
+        temp = target.with_suffix(target.suffix + ".partial")
+        size = 0
+        existing = self.store.cache_bytes()
+        try:
+            async with self._session.get(f"{self._upstream}/view", params=params) as response:
+                if response.status != 200:
+                    raise ValueError(f"artifact fetch returned HTTP {response.status}")
+                with temp.open("wb") as handle:
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        size += len(chunk)
+                        if existing + size > self.cache_max_bytes:
+                            raise ValueError("artifact cache capacity exceeded")
+                        handle.write(chunk)
+            os.replace(temp, target)
+        finally:
+            temp.unlink(missing_ok=True)
+        self.store.add_artifact(prompt_id, artifact["filename"], artifact["subfolder"], artifact["type"], target, size)
 
     @staticmethod
     def _parse_terminal_entry(history_body: bytes, prompt_id: str) -> bool:
@@ -575,18 +961,25 @@ class HttpProxyService:
                 return downstream
         except asyncio.CancelledError:
             if downstream is not None:
+                if self.profile.name == "ollama" and request_id is not None:
+                    try:
+                        async for _chunk in upstream.content.iter_chunked(64 * 1024):
+                            pass
+                        return downstream
+                    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                        pass
                 downstream.force_close()
             raise
         except asyncio.TimeoutError:
             if downstream is None:
                 raise web.HTTPGatewayTimeout(text="upstream timed out") from None
             downstream.force_close()
-            return downstream
+            raise web.HTTPGatewayTimeout(text="upstream stream timed out ambiguously") from None
         except (aiohttp.ClientError, ConnectionError):
             if downstream is None:
                 raise web.HTTPBadGateway(text="upstream request failed") from None
             downstream.force_close()
-            return downstream
+            raise web.HTTPBadGateway(text="upstream stream failed ambiguously") from None
 
 
 def _extract_prompt_id(body: bytes) -> str | None:
@@ -598,46 +991,151 @@ def _extract_prompt_id(body: bytes) -> str | None:
     return value if _is_valid_upstream_prompt_id(value) else None
 
 
+def _decode_body(body: bytes, encoding: str | None, max_bytes: int) -> bytes:
+    normalized = (encoding or "").strip().casefold()
+    try:
+        if normalized == "gzip":
+            inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            decoded = inflater.decompress(body, max_bytes + 1)
+            if len(decoded) <= max_bytes:
+                decoded += inflater.flush(max_bytes + 1 - len(decoded))
+        elif normalized == "deflate":
+            inflater = zlib.decompressobj()
+            decoded = inflater.decompress(body, max_bytes + 1)
+            if len(decoded) <= max_bytes:
+                decoded += inflater.flush(max_bytes + 1 - len(decoded))
+        elif normalized in {"", "identity"}:
+            decoded = body
+        else:
+            raise web.HTTPBadGateway(text=f"unsupported upstream content encoding: {normalized}")
+    except (OSError, zlib.error) as exc:
+        raise web.HTTPBadGateway(text="invalid compressed upstream response") from exc
+    if len(decoded) > max_bytes:
+        raise web.HTTPBadGateway(text="decoded upstream response exceeds configured limit")
+    return decoded
+
+
+async def _read_bounded(content: aiohttp.StreamReader, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in content.iter_chunked(64 * 1024):
+        total += len(chunk)
+        if total > max_bytes:
+            raise web.HTTPBadGateway(text="upstream response exceeds configured limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def run_http_proxies(
     proxy: Proxy,
     configs: list[HttpProxyConfig],
     poll_seconds: float,
     http_logger: Callable[[str], None] | None = None,
+    runtime_config: RuntimeConfig | None = None,
+    runtime_state: HttpRuntimeState | None = None,
 ) -> None:
     if not configs:
         raise ValueError("At least one HTTP listener configuration is required")
     for config in configs:
         config.validate()
-    seen: set[tuple[str, int]] = set()
-    for config in configs:
-        key = (config.listen_host.casefold(), config.listen_port)
-        if key in seen:
-            raise ValueError(
-                f"Duplicate or overlapping HTTP listener {config.listen_host}:{config.listen_port}"
-            )
-        seen.add(key)
+    for index, config in enumerate(configs):
+        for other in configs[index + 1:]:
+            if config.listen_port == other.listen_port and _same_endpoint(config.listen_host, other.listen_host):
+                raise ValueError(f"Duplicate or overlapping HTTP listener {config.listen_host}:{config.listen_port}")
+        for upstream_config in configs:
+            parsed = urlsplit(upstream_config.upstream)
+            upstream_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            if config.listen_port == upstream_port and parsed.hostname and _same_endpoint(config.listen_host, parsed.hostname):
+                raise ValueError(
+                    f"HTTP listener {config.listen_host}:{config.listen_port} overlaps {upstream_config.profile.name} upstream"
+                )
 
-    queue = HttpQueue()
+    runtime = runtime_config
+    queue = HttpQueue(
+        max_resource_streak=runtime.max_resource_streak if runtime else 5,
+        oldest_override_seconds=runtime.oldest_request_seconds if runtime else 60.0,
+    )
     logger = http_logger or proxy.logger
-    services = [HttpProxyService(config, queue, logger) for config in configs]
+    store = ExecutionStore(Path(runtime.runtime_dir)) if runtime else None
+    manager = BackendManager(runtime.managed_comfyui, Path(runtime.runtime_dir), logger) if runtime else None
+    admission = AdmissionController(
+        runtime.max_admitted_requests if runtime else min(c.max_admitted_requests for c in configs),
+        runtime.max_buffered_body_bytes if runtime else min(c.max_buffered_body_bytes for c in configs),
+    )
+    services = [
+        HttpProxyService(
+            config,
+            queue,
+            logger,
+            admission=admission,
+            store=store,
+            backend_manager=manager,
+            status_provider=proxy.status,
+            retention_days=runtime.retention_days if runtime else 7,
+            cache_max_bytes=runtime.cache_max_bytes if runtime else 10 * 1024 * 1024 * 1024,
+        )
+        for config in configs
+    ]
+    if runtime_state is not None:
+        runtime_state.queue = queue
+        runtime_state.services = services
+        runtime_state.backend_manager = manager
+        runtime_state.store = store
+        runtime_state.listener_states = {
+            config.profile.name: "starting" for config in configs
+        }
     started: list[HttpProxyService] = []
-    proxy.ensure_layout()
+    filesystem_ready = True
+    try:
+        proxy.ensure_layout()
+    except OSError as exc:
+        filesystem_ready = False
+        proxy._filesystem_degraded = str(exc)
+        proxy.logger(f"Filesystem queue unavailable; starting API listeners only: {exc}")
     proxy.logger(f"Queue root: {proxy.root}")
     with proxy.lock():
-        proxy.logger(f"Lock acquired: {proxy.control_root / 'proxy.lock'}")
-        recovered = proxy.recover_interrupted()
+        proxy.logger(f"Lock acquired: {proxy.local_runtime_dir / 'proxy.lock'}")
+        recovered = proxy.recover_interrupted() if filesystem_ready else 0
         if recovered:
             proxy.logger(f"Recovered {recovered} interrupted job(s)")
+        if store and manager:
+            pending_ollama = [record for record in store.pending() if record.get("backend") == "ollama"]
+            if pending_ollama:
+                ollama_upstream = next((c.upstream for c in configs if c.profile.name == "ollama"), None)
+                if ollama_upstream:
+                    try:
+                        await manager.reconcile_ollama(ollama_upstream)
+                    except BackendUnavailable as exc:
+                        manager.block(f"Ollama restart reconciliation failed: {exc}")
+                        for record in pending_ollama:
+                            store.update(record["request_id"], "blocked", outcome="unresolved", error=str(exc))
+                    else:
+                        for record in pending_ollama:
+                            store.update(record["request_id"], "failed", outcome="reconciled", error="abandoned downstream stream was unloaded after restart")
+                else:
+                    manager.block("An unresolved Ollama execution exists but no Ollama listener is configured for reconciliation")
         try:
             for service in services:
                 await service.start()
                 started.append(service)
+                if runtime_state is not None:
+                    runtime_state.listener_states[service.profile.name] = "listening"
+            reconciliation_service = next((service for service in services if service.profile.name == "comfyui"), services[0])
+            await reconciliation_service.reconcile_records()
+            if runtime_state is not None:
+                runtime_state.ready.set()
         except BaseException:
+            if runtime_state is not None:
+                for config in configs:
+                    if runtime_state.listener_states.get(config.profile.name) != "listening":
+                        runtime_state.listener_states[config.profile.name] = "error"
             for service in reversed(started):
                 try:
                     await service.stop()
                 except BaseException:
                     pass
+                if runtime_state is not None:
+                    runtime_state.listener_states[service.profile.name] = "stopped"
             raise
         grace = max(config.continuation_grace_seconds for config in configs)
         try:
@@ -649,13 +1147,22 @@ async def run_http_proxies(
                 queue,
                 poll_seconds=poll_seconds,
                 continuation_grace_seconds=grace,
+                backend_manager=manager,
+                ollama_upstream=next((c.upstream for c in configs if c.profile.name == "ollama"), None),
             )
         finally:
+            if runtime_state is not None:
+                for service in services:
+                    runtime_state.listener_states[service.profile.name] = "stopped"
             for service in reversed(started):
                 try:
                     await service.stop()
                 except BaseException:
                     pass
+            if manager:
+                await manager.close()
+            if store and runtime:
+                store.evict(runtime.retention_days, runtime.cache_max_bytes)
 
 
 async def run_http_proxy(
@@ -663,5 +1170,6 @@ async def run_http_proxy(
     config: HttpProxyConfig,
     poll_seconds: float,
     http_logger: Callable[[str], None] | None = None,
+    runtime_config: RuntimeConfig | None = None,
 ) -> None:
-    await run_http_proxies(proxy, [config], poll_seconds, http_logger)
+    await run_http_proxies(proxy, [config], poll_seconds, http_logger, runtime_config)

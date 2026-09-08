@@ -613,7 +613,8 @@ For a new Windows deployment:
    `Zet` checkout. Set `AI_QUEUE_ROOT` if the queue is not at
    `%USERPROFILE%\Dropbox\AI_Queue`.
 5. Start the proxy with `run_file_proxy.ps1` or `run_file_proxy.bat`. Both
-   launch `.venv\Scripts\python.exe` directly; activation is not required.
+   launch the terminal dashboard through `.venv\Scripts\python.exe` directly;
+   activation is not required.
 
 Equivalent manual setup and verification:
 
@@ -629,6 +630,19 @@ Run continuously without a wrapper:
 .\.venv\Scripts\file-proxy.exe --root "C:\path\to\AI_Queue" --registry-dir ".\registries" run
 ```
 
+Run with the interactive terminal dashboard:
+
+```powershell
+.\.venv\Scripts\file-proxy.exe --root "C:\path\to\AI_Queue" --registry-dir ".\registries" tui
+```
+
+The dashboard shows listener readiness, filesystem and HTTP queue counts,
+active work, answer totals, and a scrolling color activity log. Press `S` to
+stop the hosted proxy while leaving the dashboard open, `R` to restart it,
+`End` to resume following the log, and `Q` or `Ctrl+C` to stop safely and exit.
+Use `run` instead of `tui` for headless services and redirected output. Both
+commands accept the same runtime, listener, and scheduler options.
+
 After pulling changes that modify `pyproject.toml`, rerun the setup script to
 refresh the environment.
 
@@ -640,7 +654,7 @@ Useful commands:
 .venv\Scripts\file-proxy.exe --root ROOT --registry-dir REGISTRIES validate-subscriber ID
 ```
 
-`run` also accepts `--poll-seconds`, `--sync-grace-seconds`, and
+`run` and `tui` also accept `--poll-seconds`, `--sync-grace-seconds`, and
 `--max-resource-streak`.
 
 When scheduling enters an Ollama resource after startup or non-Ollama work,
@@ -723,8 +737,29 @@ job starts waits for that job to finish.
 The launch scripts enable HTTP mode when `AI_PROXY_HTTP_PORT` is set. They also
 accept `AI_PROXY_HTTP_HOST`, `AI_PROXY_OLLAMA_UPSTREAM`,
 `AI_PROXY_HTTP_CONTINUATION_GRACE_SECONDS`, `AI_PROXY_HTTP_MAX_BODY_BYTES`, and
-`AI_PROXY_HTTP_UPSTREAM_TIMEOUT_SECONDS`. The HTTP queue is memory-only;
-disconnects and process restarts cannot be recovered as live HTTP requests.
+`AI_PROXY_HTTP_UPSTREAM_TIMEOUT_SECONDS`. Undispatched HTTP bodies remain
+memory-only and are never replayed. Accepted lifecycle outcomes and archived
+ComfyUI results are durable in the configured local runtime directory.
+
+## Reliable ComfyUI lifecycle
+
+Add `--comfyui-listen-port 18188` to expose the queued ComfyUI API beside the
+Ollama listener. Both listeners and filesystem workers share one GPU arbiter.
+Native `/prompt` work holds the slot until keyed terminal history exists and its
+standard output artifacts have been archived locally. Use the proxy for
+`/prompt`, `/history`, and `/view`; use raw ComfyUI `/ws` only for progress.
+
+Managed startup is optional and disabled by default. Pass
+`--runtime-config runtime-config.example.json` after copying and reviewing the
+machine-specific example. Managed mode unloads Ollama before starting ComfyUI,
+stops owned ComfyUI before Ollama, reuses it for consecutive image jobs, and
+stops it on idle. It never adopts or terminates a manually started instance.
+
+The launchers accept `AI_PROXY_RUNTIME_CONFIG`, `AI_PROXY_COMFYUI_PORT`, and
+`AI_PROXY_COMFYUI_UPSTREAM`. Runtime status and durable outcomes are available
+at `/_proxy/status` and `/_proxy/jobs/{request_id}` on either listener. See
+[the managed ComfyUI contract](Docs/ComfyUI_Http_Proxy.md) for routing,
+retention, overload, recovery, and Comfy Desktop coexistence details.
 
 ## Dropbox deployment
 

@@ -2,6 +2,7 @@
   "subscriber_id": "zet",
   "workers": {
     "ollama": {
+      "backend": "ollama",
       "command": [
         "python3",
         "-m",
@@ -11,6 +12,7 @@
       "timeout_seconds": 7500
     },
     "local_image": {
+      "backend": "comfyui",
       "command": [
         "python3",
         "-m",

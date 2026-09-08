@@ -56,6 +56,10 @@ def validate_resource_key(value: Any) -> str | None:
         or any(ord(character) < 32 for character in value)
     ):
         raise InvalidJob("resource_key is invalid")
+    if value.casefold().startswith("image:comfyui:"):
+        return "comfyui:" + value[len("image:comfyui:"):]
+    if value.casefold() == "image:comfyui":
+        return "comfyui"
     return value
 
 
@@ -94,6 +98,7 @@ class WorkerRegistration:
     command: tuple[str, ...]
     timeout_seconds: float
     working_directory: str | None = None
+    backend: str | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> "WorkerRegistration":
@@ -114,7 +119,10 @@ class WorkerRegistration:
             not isinstance(working_directory, str) or not working_directory
         ):
             raise ValueError("worker working_directory must be a non-empty string")
-        return cls(tuple(command), float(timeout), working_directory)
+        backend = data.get("backend")
+        if backend is not None and backend not in {"ollama", "comfyui"}:
+            raise ValueError("worker backend must be 'ollama' or 'comfyui'")
+        return cls(tuple(command), float(timeout), working_directory, backend)
 
 
 @dataclass
