@@ -28,7 +28,8 @@ if defined AI_PROXY_HTTP_PORT (
 )
 if defined AI_PROXY_COMFYUI_PORT (
   if not defined AI_PROXY_COMFYUI_UPSTREAM set "AI_PROXY_COMFYUI_UPSTREAM=http://127.0.0.1:8188"
-  set "HTTP_ARGS=%HTTP_ARGS% --comfyui-listen-port %AI_PROXY_COMFYUI_PORT% --comfyui-upstream %AI_PROXY_COMFYUI_UPSTREAM%"
+  REM Do not run comfyui http proxy for now
+  REM set "HTTP_ARGS=%HTTP_ARGS% --comfyui-listen-port %AI_PROXY_COMFYUI_PORT% --comfyui-upstream %AI_PROXY_COMFYUI_UPSTREAM%"
 )
 echo Starting File Proxy...
 "%VENV_PYTHON%" -m file_proxy.cli --root "%AI_QUEUE_ROOT%" --registry-dir "%~dp0registries" %RUNTIME_ARGS% tui --sync-grace-seconds "%FILE_PROXY_SYNC_GRACE_SECONDS%" %HTTP_ARGS%

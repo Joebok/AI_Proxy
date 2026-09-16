@@ -27,6 +27,7 @@ class ManagedComfyUIConfig:
 @dataclass(frozen=True)
 class RuntimeConfig:
     runtime_dir: str = ".ai-proxy-runtime"
+    ollama_reasoning_policy_path: str | None = None
     managed_comfyui: ManagedComfyUIConfig = field(default_factory=ManagedComfyUIConfig)
     generation_settlement_seconds: float = 7500.0
     cancellation_grace_seconds: float = 30.0
@@ -85,6 +86,7 @@ class RuntimeConfig:
         return replace(
             self,
             runtime_dir=str(runtime_dir if runtime_dir.is_absolute() else (base / runtime_dir).resolve()),
+            ollama_reasoning_policy_path=absolute(self.ollama_reasoning_policy_path),
             managed_comfyui=managed,
         )
 

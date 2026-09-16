@@ -42,10 +42,11 @@ if ($env:AI_PROXY_HTTP_PORT) {
     )
 }
 if ($env:AI_PROXY_COMFYUI_PORT) {
-    $proxyArgs += @(
-        "--comfyui-listen-port", $env:AI_PROXY_COMFYUI_PORT,
-        "--comfyui-upstream", $(if ($env:AI_PROXY_COMFYUI_UPSTREAM) { $env:AI_PROXY_COMFYUI_UPSTREAM } else { "http://127.0.0.1:8188" })
-    )
+    # Do not run comfyui http proxy for now
+    # $proxyArgs += @(
+    #    "--comfyui-listen-port", $env:AI_PROXY_COMFYUI_PORT,
+    #    "--comfyui-upstream", $(if ($env:AI_PROXY_COMFYUI_UPSTREAM) { $env:AI_PROXY_COMFYUI_UPSTREAM } else { "http://127.0.0.1:8188" })
+    #)
 }
 & $venvPython @proxyArgs
 exit $LASTEXITCODE

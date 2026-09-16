@@ -8,7 +8,12 @@ from aiohttp import ClientSession, web
 import pytest
 
 from file_proxy.engine import Proxy
-from file_proxy.http_proxy import HttpProxyConfig, HttpProxyService, parse_bypass_route, request_resource_key
+from file_proxy.http_proxy import (
+    HttpProxyConfig,
+    HttpProxyService,
+    parse_bypass_route,
+    request_resource_key,
+)
 from file_proxy.registry import Registry
 from file_proxy.scheduler import HttpQueue
 

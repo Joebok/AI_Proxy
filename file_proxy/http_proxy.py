@@ -20,6 +20,7 @@ from .scheduler import HttpQueue
 from .backend import BackendManager, BackendUnavailable
 from .store import ExecutionStore
 from .runtime import RuntimeConfig
+from .reasoning_policy import ReasoningPolicyStore
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -339,6 +340,7 @@ class HttpProxyService:
         store: ExecutionStore | None = None,
         backend_manager: BackendManager | None = None,
         status_provider: Callable[[], dict[str, object]] | None = None,
+        reasoning_policies: ReasoningPolicyStore | None = None,
         retention_days: int = 7,
         cache_max_bytes: int = 10 * 1024 * 1024 * 1024,
     ) -> None:
@@ -356,6 +358,7 @@ class HttpProxyService:
         self.store = store
         self.backend_manager = backend_manager
         self.status_provider = status_provider
+        self.reasoning_policies = reasoning_policies
         self.retention_days = retention_days
         self.cache_max_bytes = cache_max_bytes
         self._cache_error: str | None = None
@@ -463,6 +466,16 @@ class HttpProxyService:
         try:
             body = await self._read_body(request, admitted=True)
             buffered = len(body)
+            if self.profile.name == "ollama" and self.reasoning_policies:
+                normalized = self.reasoning_policies.normalize(request.method, request.path, body)
+                body = normalized.body
+                if normalized.operation:
+                    self.logger(
+                        "Reasoning policy "
+                        f"alias={normalized.alias} requested={normalized.requested} "
+                        f"operation={normalized.operation} effective={normalized.effective or 'unknown'} "
+                        f"revision={normalized.revision_id or 'unknown'}"
+                    )
         except BaseException:
             await self.admission.leave(0)
             raise
@@ -585,6 +598,9 @@ class HttpProxyService:
                 data["cache"] = {**self.store.status(), "error": self._cache_error}
             if self.status_provider:
                 data["filesystem"] = self.status_provider()
+            if self.profile.name == "ollama" and self.reasoning_policies:
+                self.reasoning_policies.refresh()
+                data["reasoning_policy"] = self.reasoning_policies.status()
             return web.json_response(data)
         if request.method == "GET" and request.path.startswith("/_proxy/jobs/"):
             record = self.store.get(request.path.rsplit("/", 1)[-1]) if self.store else None
@@ -941,10 +957,17 @@ class HttpProxyService:
         url = f"{self._upstream}{request.raw_path}"
         downstream: web.StreamResponse | None = None
         try:
+            request_headers = _forward_headers(request.headers, request=True)
+            if request.content_length is not None and request.content_length != len(body):
+                request_headers = [
+                    (name, value)
+                    for name, value in request_headers
+                    if name.casefold() != "content-length"
+                ]
             async with self._session.request(
                 request.method,
                 url,
-                headers=_forward_headers(request.headers, request=True),
+                headers=request_headers,
                 data=body,
                 allow_redirects=False,
             ) as upstream:
@@ -1062,6 +1085,11 @@ async def run_http_proxies(
         runtime.max_admitted_requests if runtime else min(c.max_admitted_requests for c in configs),
         runtime.max_buffered_body_bytes if runtime else min(c.max_buffered_body_bytes for c in configs),
     )
+    reasoning_policies = ReasoningPolicyStore(
+        runtime.ollama_reasoning_policy_path if runtime else None,
+        logger,
+    )
+    reasoning_policies.refresh()
     services = [
         HttpProxyService(
             config,
@@ -1071,6 +1099,7 @@ async def run_http_proxies(
             store=store,
             backend_manager=manager,
             status_provider=proxy.status,
+            reasoning_policies=reasoning_policies if config.profile.name == "ollama" else None,
             retention_days=runtime.retention_days if runtime else 7,
             cache_max_bytes=runtime.cache_max_bytes if runtime else 10 * 1024 * 1024 * 1024,
         )
