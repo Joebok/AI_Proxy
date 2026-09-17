@@ -88,6 +88,33 @@ def test_runtime_config_is_opt_in_and_validates_unknown_keys(tmp_path: Path) -> 
         RuntimeConfig.load(path)
 
 
+def test_external_comfyui_cli_disables_managed_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from file_proxy import cli
+
+    runtime_path = tmp_path / "runtime.json"
+    runtime_path.write_text(
+        '{"managed_comfyui":{"enabled":true,"executable":"missing","working_directory":"missing"}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.Registry, "load", lambda _path: Registry({}))
+    monkeypatch.setattr(cli.Proxy, "once", lambda _self: None)
+
+    result = cli.main([
+        "--root", str(tmp_path / "queue"),
+        "--registry-dir", str(tmp_path),
+        "--runtime-config", str(runtime_path),
+        "once",
+    ])
+    assert result == 2
+
+    parsed = cli.parser().parse_args([
+        "--root", str(tmp_path / "queue"),
+        "--registry-dir", str(tmp_path),
+        "tui", "--external-comfyui",
+    ])
+    assert parsed.external_comfyui
+
+
 def test_prompt_holds_shared_slot_until_keyed_history(tmp_path: Path) -> None:
     async def scenario() -> None:
         settled = asyncio.Event()

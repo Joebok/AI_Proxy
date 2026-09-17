@@ -26,10 +26,5 @@ if defined AI_PROXY_RUNTIME_CONFIG set RUNTIME_ARGS=--runtime-config "%AI_PROXY_
 if defined AI_PROXY_HTTP_PORT (
   set "HTTP_ARGS=--http-listen-host %AI_PROXY_HTTP_HOST% --http-listen-port %AI_PROXY_HTTP_PORT% --ollama-upstream %AI_PROXY_OLLAMA_UPSTREAM% --http-continuation-grace-seconds %AI_PROXY_HTTP_CONTINUATION_GRACE_SECONDS% --http-max-body-bytes %AI_PROXY_HTTP_MAX_BODY_BYTES% --http-upstream-timeout-seconds %AI_PROXY_HTTP_UPSTREAM_TIMEOUT_SECONDS%"
 )
-if defined AI_PROXY_COMFYUI_PORT (
-  if not defined AI_PROXY_COMFYUI_UPSTREAM set "AI_PROXY_COMFYUI_UPSTREAM=http://127.0.0.1:8188"
-  REM Do not run comfyui http proxy for now
-  REM set "HTTP_ARGS=%HTTP_ARGS% --comfyui-listen-port %AI_PROXY_COMFYUI_PORT% --comfyui-upstream %AI_PROXY_COMFYUI_UPSTREAM%"
-)
 echo Starting File Proxy...
-"%VENV_PYTHON%" -m file_proxy.cli --root "%AI_QUEUE_ROOT%" --registry-dir "%~dp0registries" %RUNTIME_ARGS% tui --sync-grace-seconds "%FILE_PROXY_SYNC_GRACE_SECONDS%" %HTTP_ARGS%
+"%VENV_PYTHON%" -m file_proxy.cli --root "%AI_QUEUE_ROOT%" --registry-dir "%~dp0registries" %RUNTIME_ARGS% tui --sync-grace-seconds "%FILE_PROXY_SYNC_GRACE_SECONDS%" --external-comfyui %HTTP_ARGS%

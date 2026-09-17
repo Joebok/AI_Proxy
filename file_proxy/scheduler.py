@@ -16,6 +16,7 @@ class HttpJob:
     backend: str | None = None
     barrier: bool = False
     enqueued_at: float = 0.0
+    enqueued_wall_time: float = 0.0
     cancelled: bool = False
     start_error: str | None = None
     dispatched: bool = False
@@ -47,6 +48,7 @@ class HttpQueue:
             backend=backend,
             barrier=barrier,
             enqueued_at=loop.time(),
+            enqueued_wall_time=time.time(),
         )
         self._jobs.append(job)
         self._changed.set()
@@ -61,19 +63,8 @@ class HttpQueue:
         if not self._jobs:
             self._changed.clear()
             return None
-        now = asyncio.get_running_loop().time()
-        prefix: list[HttpJob] = []
-        for job in self._jobs:
-            prefix.append(job)
-            if job.barrier:
-                break
-        first = prefix[0]
-        if first.barrier or now - first.enqueued_at >= self.oldest_override_seconds:
-            selected = first
-        elif self._resource_key and self._resource_streak < self.max_resource_streak:
-            selected = next((j for j in prefix if not j.barrier and j.resource_key == self._resource_key), first)
-        else:
-            selected = next((j for j in prefix if j.barrier or j.resource_key != self._resource_key), first)
+        selected = self._candidate()
+        assert selected is not None
         self._jobs.remove(selected)
         if selected.resource_key and selected.resource_key == self._resource_key:
             self._resource_streak += 1
@@ -86,6 +77,41 @@ class HttpQueue:
         if not self._jobs:
             self._changed.clear()
         return selected
+
+    def peek(self) -> HttpJob | None:
+        self._jobs = deque(job for job in self._jobs if not job.cancelled)
+        return self._candidate()
+
+    def _candidate(self) -> HttpJob | None:
+        if not self._jobs:
+            return None
+        now = asyncio.get_running_loop().time()
+        prefix: list[HttpJob] = []
+        first_backend = self._backend(self._jobs[0])
+        for job in self._jobs:
+            if prefix and self._backend(job) != first_backend:
+                break
+            prefix.append(job)
+            if job.barrier:
+                break
+        first = prefix[0]
+        if first.barrier or now - first.enqueued_at >= self.oldest_override_seconds:
+            selected = first
+        elif self._resource_key and self._resource_streak < self.max_resource_streak:
+            selected = next((j for j in prefix if not j.barrier and j.resource_key == self._resource_key), first)
+        else:
+            selected = next((j for j in prefix if j.barrier or j.resource_key != self._resource_key), first)
+        return selected
+
+    @staticmethod
+    def _backend(job: HttpJob) -> str | None:
+        if job.backend:
+            return job.backend
+        if job.resource_key and ":" in job.resource_key:
+            prefix = job.resource_key.split(":", 1)[0]
+            if prefix in {"ollama", "comfyui"}:
+                return prefix
+        return None
 
     def has_waiting(self) -> bool:
         return any(not job.cancelled for job in self._jobs)

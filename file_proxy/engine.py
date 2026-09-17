@@ -319,14 +319,30 @@ class Proxy:
         resource_key: str | None,
         resource_streak: int,
     ) -> QueueJob:
+        first_backend = self._file_job_backend(jobs[0])
+        eligible: list[QueueJob] = []
+        for job in jobs:
+            if eligible and self._file_job_backend(job) != first_backend:
+                break
+            eligible.append(job)
         if resource_key is None:
-            return jobs[0]
+            return eligible[0]
         if resource_streak < self.max_resource_streak:
-            matching = next((job for job in jobs if job.manifest.resource_key == resource_key), None)
+            matching = next((job for job in eligible if job.manifest.resource_key == resource_key), None)
             if matching is not None:
                 return matching
-        different = next((job for job in jobs if job.manifest.resource_key != resource_key), None)
-        return different or jobs[0]
+        different = next((job for job in eligible if job.manifest.resource_key != resource_key), None)
+        return different or eligible[0]
+
+    def _file_job_backend(self, job: QueueJob) -> str | None:
+        registration = self.registry.worker(job.manifest.subscriber_id, job.manifest.worker)
+        if registration and registration.backend:
+            return registration.backend
+        if job.manifest.resource_key and ":" in job.manifest.resource_key:
+            prefix = job.manifest.resource_key.split(":", 1)[0]
+            if prefix in {"ollama", "comfyui"}:
+                return prefix
+        return None
 
     def _record_resource_job(self, manifest: JobManifest) -> None:
         self._record_resource_key(manifest.resource_key)
@@ -508,9 +524,31 @@ class Proxy:
         ollama_upstream: str | None = None,
     ) -> None:
         last_http_completed: float | None = None
+        deferred_selected: QueueJob | tuple[Path, str, str, str] | None = None
         loop = asyncio.get_running_loop()
         while True:
-            http_job = http_queue.pop()
+            selected = deferred_selected
+            deferred_selected = None
+            http_candidate = http_queue.peek()
+            if http_candidate is not None and selected is None:
+                try:
+                    selected = await asyncio.to_thread(self._select_file_job)
+                    self._filesystem_degraded = None
+                except OSError as exc:
+                    self._filesystem_degraded = str(exc)
+                    self.logger(f"Filesystem queue unavailable; API listeners remain active: {exc}")
+            if http_candidate is not None and selected is not None:
+                if isinstance(selected, QueueJob):
+                    file_backend = self._file_job_backend(selected)
+                    http_backend = HttpQueue._backend(http_candidate)
+                    file_is_older = selected.manifest.created_at.timestamp() <= http_candidate.enqueued_wall_time
+                    if not (file_is_older and file_backend and http_backend and file_backend != http_backend):
+                        deferred_selected = selected
+                        selected = None
+                else:
+                    deferred_selected = selected
+                    selected = None
+            http_job = None if selected is not None else http_queue.pop()
             if http_job is not None:
                 try:
                     if backend_manager:
@@ -530,19 +568,21 @@ class Proxy:
             if last_http_completed is not None:
                 remaining = continuation_grace_seconds - (loop.time() - last_http_completed)
                 if remaining > 0:
+                    deferred_selected = selected
                     await http_queue.wait(remaining)
                     continue
                 last_http_completed = None
 
-            try:
-                selected = await asyncio.to_thread(self._select_file_job)
-                self._filesystem_degraded = None
-            except OSError as exc:
-                self._filesystem_degraded = str(exc)
-                self.logger(f"Filesystem queue unavailable; API listeners remain active: {exc}")
-                await http_queue.wait(poll_seconds)
-                continue
-            if http_queue.has_waiting():
+            if selected is None:
+                try:
+                    selected = await asyncio.to_thread(self._select_file_job)
+                    self._filesystem_degraded = None
+                except OSError as exc:
+                    self._filesystem_degraded = str(exc)
+                    self.logger(f"Filesystem queue unavailable; API listeners remain active: {exc}")
+                    await http_queue.wait(poll_seconds)
+                    continue
+            if http_queue.has_waiting() and selected is None:
                 continue
             if selected is None:
                 await http_queue.wait(poll_seconds)

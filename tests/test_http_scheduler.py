@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 import threading
 
 import pytest
 
 from file_proxy.engine import Proxy
+from file_proxy.models import JobManifest, QueueJob
 from file_proxy.registry import Registry
 from file_proxy.scheduler import HttpQueue
 
@@ -36,6 +38,33 @@ def test_http_queue_is_fifo(tmp_path: Path) -> None:
             scheduler.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await scheduler
+
+    asyncio.run(scenario())
+
+
+def test_http_affinity_does_not_overtake_other_backend() -> None:
+    async def scenario() -> None:
+        queue = HttpQueue()
+        first = queue.enqueue("ollama:a", backend="ollama")
+        comfy = queue.enqueue("comfyui:model", backend="comfyui")
+        matching = queue.enqueue("ollama:a", backend="ollama")
+
+        assert queue.pop() is first
+        queue.finish(first)
+        assert queue.pop() is comfy
+        queue.finish(comfy)
+        assert queue.pop() is matching
+
+        reverse = HttpQueue()
+        first_comfy = reverse.enqueue("comfyui:model", backend="comfyui")
+        ollama = reverse.enqueue("ollama:a", backend="ollama")
+        matching_comfy = reverse.enqueue("comfyui:model", backend="comfyui")
+
+        assert reverse.pop() is first_comfy
+        reverse.finish(first_comfy)
+        assert reverse.pop() is ollama
+        reverse.finish(ollama)
+        assert reverse.pop() is matching_comfy
 
     asyncio.run(scenario())
 
@@ -95,6 +124,56 @@ def test_http_has_preference_and_continuation_grace(tmp_path: Path) -> None:
             queue.finish(second)
             assert await asyncio.to_thread(file_started.wait, 1)
         finally:
+            scheduler.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await scheduler
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("file_backend", "http_backend"),
+    [("comfyui", "ollama"), ("ollama", "comfyui")],
+)
+def test_http_does_not_overtake_older_file_job_from_other_backend(
+    tmp_path: Path, file_backend: str, http_backend: str
+) -> None:
+    async def scenario() -> None:
+        proxy = make_proxy(tmp_path)
+        queue = HttpQueue()
+        file_started = threading.Event()
+        release_file = threading.Event()
+        selected = QueueJob(
+            tmp_path / "file-job",
+            JobManifest(
+                protocol_version=1,
+                created_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+                resource_key=f"{file_backend}:model",
+                subscriber_id="test",
+                worker="worker",
+                job_id="file-job",
+            ),
+        )
+        selections = [selected]
+        proxy._select_file_job = lambda: selections.pop(0) if selections else None  # type: ignore[method-assign]
+        proxy._file_job_backend = lambda _job: file_backend  # type: ignore[method-assign]
+        def process_file(_job) -> None:
+            file_started.set()
+            release_file.wait(1)
+
+        proxy._process_file_job = process_file  # type: ignore[method-assign]
+        http_job = queue.enqueue(f"{http_backend}:model", backend=http_backend)
+        scheduler = asyncio.create_task(
+            proxy.run_scheduler(queue, poll_seconds=0.01, continuation_grace_seconds=0)
+        )
+        try:
+            assert await asyncio.to_thread(file_started.wait, 1)
+            assert not http_job.started.done()
+            release_file.set()
+            await asyncio.wait_for(http_job.started, 1)
+            queue.finish(http_job)
+        finally:
+            release_file.set()
             scheduler.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await scheduler

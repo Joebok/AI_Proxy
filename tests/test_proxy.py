@@ -180,6 +180,21 @@ def test_resource_affinity_is_bounded_before_oldest_different_job_runs(tmp_path:
     assert processed == ["a1", "a2", "b1", "b2", "a3"]
 
 
+def test_resource_affinity_does_not_overtake_other_backend(tmp_path: Path) -> None:
+    proxy = Proxy(
+        tmp_path / "File_Proxy",
+        write_registry(tmp_path / "registry"),
+        max_resource_streak=5,
+    )
+    publish(proxy.root, "a1", created_at="2026-01-01T00:00:01Z", resource_key="ollama:a")
+    publish(proxy.root, "c1", created_at="2026-01-01T00:00:02Z", resource_key="comfyui:model")
+    publish(proxy.root, "a2", created_at="2026-01-01T00:00:03Z", resource_key="ollama:a")
+
+    processed = [proxy.once().name for _ in range(3)]
+
+    assert processed == ["a1", "c1", "a2"]
+
+
 def test_worker_receives_next_scheduled_resource_hint(tmp_path: Path) -> None:
     messages: list[str] = []
     proxy = Proxy(

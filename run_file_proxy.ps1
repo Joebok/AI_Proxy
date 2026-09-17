@@ -30,7 +30,7 @@ $proxyArgs = @(
 if ($env:AI_PROXY_RUNTIME_CONFIG) {
     $proxyArgs += @("--runtime-config", $env:AI_PROXY_RUNTIME_CONFIG)
 }
-$proxyArgs += @("tui", "--sync-grace-seconds", $env:FILE_PROXY_SYNC_GRACE_SECONDS)
+$proxyArgs += @("tui", "--sync-grace-seconds", $env:FILE_PROXY_SYNC_GRACE_SECONDS, "--external-comfyui")
 if ($env:AI_PROXY_HTTP_PORT) {
     $proxyArgs += @(
         "--http-listen-host", $(if ($env:AI_PROXY_HTTP_HOST) { $env:AI_PROXY_HTTP_HOST } else { "127.0.0.1" }),
@@ -40,13 +40,6 @@ if ($env:AI_PROXY_HTTP_PORT) {
         "--http-max-body-bytes", $(if ($env:AI_PROXY_HTTP_MAX_BODY_BYTES) { $env:AI_PROXY_HTTP_MAX_BODY_BYTES } else { "104857600" }),
         "--http-upstream-timeout-seconds", $(if ($env:AI_PROXY_HTTP_UPSTREAM_TIMEOUT_SECONDS) { $env:AI_PROXY_HTTP_UPSTREAM_TIMEOUT_SECONDS } else { "7500" })
     )
-}
-if ($env:AI_PROXY_COMFYUI_PORT) {
-    # Do not run comfyui http proxy for now
-    # $proxyArgs += @(
-    #    "--comfyui-listen-port", $env:AI_PROXY_COMFYUI_PORT,
-    #    "--comfyui-upstream", $(if ($env:AI_PROXY_COMFYUI_UPSTREAM) { $env:AI_PROXY_COMFYUI_UPSTREAM } else { "http://127.0.0.1:8188" })
-    #)
 }
 & $venvPython @proxyArgs
 exit $LASTEXITCODE

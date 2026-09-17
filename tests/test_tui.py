@@ -279,4 +279,6 @@ def test_tui_cli_matches_run_options_and_launchers_select_it() -> None:
     )
     root = Path(__file__).parents[1]
     assert '@("tui", "--sync-grace-seconds"' in (root / "run_file_proxy.ps1").read_text()
+    assert "--external-comfyui" in (root / "run_file_proxy.ps1").read_text()
     assert " tui --sync-grace-seconds " in (root / "run_file_proxy.bat").read_text()
+    assert "--external-comfyui" in (root / "run_file_proxy.bat").read_text()

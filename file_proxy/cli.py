@@ -39,6 +39,11 @@ def _add_run_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument("--http-bypass-route", action="append", default=[], metavar="'METHOD /path'")
     command.add_argument("--comfyui-listen-port", type=int, default=None)
     command.add_argument("--comfyui-upstream")
+    command.add_argument(
+        "--external-comfyui",
+        action="store_true",
+        help="disable managed ComfyUI process handling; workers must use an existing instance",
+    )
     command.add_argument("--http-settle-poll-seconds", type=float, default=1.0)
 
 
@@ -121,6 +126,11 @@ def main(argv: list[str] | None = None) -> int:
             max_buffered_body_bytes=cli_buffered if cli_buffered is not None else runtime.max_buffered_body_bytes,
             queue_wait_seconds=cli_queue_wait if cli_queue_wait is not None else runtime.queue_wait_seconds,
         )
+        if getattr(args, "external_comfyui", False):
+            runtime = replace(
+                runtime,
+                managed_comfyui=replace(runtime.managed_comfyui, enabled=False),
+            )
         cli_comfyui_upstream = getattr(args, "comfyui_upstream", None)
         comfyui_upstream = cli_comfyui_upstream if cli_comfyui_upstream is not None else runtime.managed_comfyui.upstream
         runtime = replace(runtime, managed_comfyui=replace(runtime.managed_comfyui, upstream=comfyui_upstream))
