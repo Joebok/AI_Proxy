@@ -748,25 +748,26 @@ headers and request/response bodies are never logged. Files roll daily and the
 runtime removes files older than `diagnostic_log_retention_days` (three days by
 default).
 
-## Reliable ComfyUI lifecycle
+## Managed file-proxy GPU lifecycle
 
-Add `--comfyui-listen-port 18188` to expose the queued ComfyUI API beside the
-Ollama listener. Both listeners and filesystem workers share one GPU arbiter.
-Native `/prompt` work holds the slot until keyed terminal history exists and its
-standard output artifacts have been archived locally. Use the proxy for
-`/prompt`, `/history`, and `/view`; use raw ComfyUI `/ws` only for progress.
+Zet stages ComfyUI render requests through the filesystem queue. The standard
+`run_file_proxy.ps1` and `.bat` launchers do not start a ComfyUI HTTP proxy.
+When managed mode is enabled in `AI_PROXY_RUNTIME_CONFIG`, AI_Proxy starts the
+configured ComfyUI Python process for file jobs, unloads resident Ollama models
+before startup, stops owned ComfyUI before Ollama work, reuses ComfyUI for
+consecutive image jobs, and stops it after the idle interval. It never adopts
+or terminates a manually started ComfyUI instance.
 
-Managed startup is optional and disabled by default. Pass
-`--runtime-config runtime-config.example.json` after copying and reviewing the
-machine-specific example. Managed mode unloads Ollama before starting ComfyUI,
-stops owned ComfyUI before Ollama, reuses it for consecutive image jobs, and
-stops it on idle. It never adopts or terminates a manually started instance.
-
-The launchers accept `AI_PROXY_RUNTIME_CONFIG`, `AI_PROXY_COMFYUI_PORT`, and
-`AI_PROXY_COMFYUI_UPSTREAM`. Runtime status and durable outcomes are available
-at `/_proxy/status` and `/_proxy/jobs/{request_id}` on either listener. See
-[the managed ComfyUI contract](Docs/ComfyUI_Http_Proxy.md) for routing,
-retention, overload, recovery, and Comfy Desktop coexistence details.
+Managed mode remains disabled in the example config. Copy and review
+`runtime-config.example.json`, then enable it in a local private config and set
+`AI_PROXY_RUNTIME_CONFIG`. The launchers respect that setting. Use
+`--external-comfyui` only when you intend to manage ComfyUI yourself. The
+dashboard reports Ollama reachability and resident model names separately from
+ComfyUI process and endpoint status. `/_proxy/status` adds these details under
+`backends`. ComfyUI lifecycle readiness uses `/queue`; CUDA memory diagnostics
+from `/system_stats` do not decide whether a render succeeded. See
+[the managed ComfyUI contract](Docs/ComfyUI_Http_Proxy.md) for the optional
+queued HTTP API and managed process details.
 
 ## Dropbox deployment
 

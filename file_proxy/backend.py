@@ -33,10 +33,17 @@ class BackendStatus:
 class BackendManager:
     """Own process state and safe GPU transitions; it never kills external services."""
 
-    def __init__(self, config: ManagedComfyUIConfig, runtime_dir: Path, logger: Callable[[str], None]) -> None:
+    def __init__(
+        self,
+        config: ManagedComfyUIConfig,
+        runtime_dir: Path,
+        logger: Callable[[str], None],
+        ollama_upstream: str = "http://127.0.0.1:11434",
+    ) -> None:
         self.config = config
         self.runtime_dir = runtime_dir
         self.logger = logger
+        self.ollama_upstream = ollama_upstream.rstrip("/")
         self.state = "stopped" if config.enabled else "ready"
         self.ownership = "proxy" if config.enabled else "external"
         self.blocked_reason: str | None = None
@@ -68,7 +75,55 @@ class BackendManager:
             "process_created_at": self._process_created_at,
             "recent_logs": list(self._logs)[-20:],
             "transitions": list(self._transitions),
+            "endpoint_ready": None,
         }
+
+    async def health_status(self) -> dict[str, object]:
+        """Report backend health without querying ComfyUI GPU memory statistics."""
+        (comfy_ready, comfy_reachable), ollama = await asyncio.gather(
+            self._probe_comfyui(), self._ollama_health_status()
+        )
+        comfy = self.status()
+        comfy.update(
+            reachable=comfy_reachable,
+            endpoint_ready=comfy_ready,
+            endpoint=self.config.upstream,
+        )
+        if comfy_reachable and not comfy_ready:
+            comfy["health_error"] = "ComfyUI endpoint responded, but /queue was not healthy"
+        return {"ollama": ollama, "comfyui": comfy}
+
+    async def _ollama_health_status(self) -> dict[str, object]:
+        ollama: dict[str, object] = {
+            "upstream": self.ollama_upstream,
+            "reachable": False,
+            "loaded_models": [],
+            "error": None,
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=1.5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"{self.ollama_upstream}/api/ps") as response:
+                    if response.status >= 300:
+                        raise BackendUnavailable(f"Ollama /api/ps returned HTTP {response.status}")
+                    payload = await response.json()
+            models = payload.get("models", []) if isinstance(payload, dict) else None
+            if not isinstance(models, list):
+                raise BackendUnavailable("Ollama /api/ps returned an invalid model list")
+            ollama.update(
+                reachable=True,
+                loaded_models=[
+                    {
+                        "name": str(model.get("name") or model.get("model")),
+                        "size_vram": int(model.get("size_vram") or 0),
+                    }
+                    for model in models
+                    if isinstance(model, dict) and (model.get("name") or model.get("model"))
+                ],
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, json.JSONDecodeError, BackendUnavailable) as exc:
+            ollama["error"] = str(exc)
+        return ollama
 
     def block(self, reason: str) -> None:
         self.blocked_reason = reason
@@ -81,7 +136,7 @@ class BackendManager:
             self._idle_task.cancel()
             self._idle_task = None
         if backend == "comfyui":
-            await self.ensure_comfyui(ollama_upstream)
+            await self.ensure_comfyui(ollama_upstream or self.ollama_upstream)
         elif backend == "ollama" and self.config.enabled:
             await self.stop_comfyui()
         self.active_backend = backend
@@ -113,10 +168,13 @@ class BackendManager:
         if not self.config.enabled:
             return
         async with self._lock:
-            if self._process and self._process.poll() is None and await self._ready():
-                self._set_state("ready")
-                return
-            if await self._ready():
+            ready, reachable = await self._probe_comfyui()
+            if self._process and self._process.poll() is None:
+                if ready:
+                    self._set_state("ready")
+                    return
+                raise BackendUnavailable("Managed ComfyUI is running but its /queue endpoint is not healthy")
+            if reachable:
                 self._set_state("blocked")
                 self.ownership = "external"
                 self.blocked_reason = (
@@ -295,31 +353,70 @@ class BackendManager:
             stream.close()
 
     async def _ready(self) -> bool:
+        ready, _reachable = await self._probe_comfyui()
+        return ready
+
+    async def _probe_comfyui(self) -> tuple[bool, bool]:
+        """Return (healthy, reachable); /queue avoids ComfyUI's CUDA stats handler."""
         try:
             timeout = aiohttp.ClientTimeout(total=1.0)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(f"{self.config.upstream.rstrip('/')}/system_stats") as response:
-                    return 200 <= response.status < 300
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                async with session.get(f"{self.config.upstream.rstrip('/')}/queue") as response:
+                    if response.status < 200 or response.status >= 300:
+                        return False, True
+                    payload = await response.json()
+                    ready = (
+                        isinstance(payload, dict)
+                        and isinstance(payload.get("queue_running"), list)
+                        and isinstance(payload.get("queue_pending"), list)
+                    )
+                    return ready, True
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, json.JSONDecodeError):
+            return False, await asyncio.to_thread(self._comfyui_port_open)
+
+    def _comfyui_port_open(self) -> bool:
+        parsed = urlsplit(self.config.upstream)
+        if not parsed.hostname:
+            return False
+        try:
+            with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=0.25):
+                return True
+        except OSError:
             return False
 
     async def _unload_ollama(self, upstream: str) -> None:
+        upstream = upstream.rstrip("/")
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
                 async with session.get(f"{upstream.rstrip('/')}/api/ps") as response:
+                    if response.status >= 300:
+                        raise BackendUnavailable(f"Ollama /api/ps returned HTTP {response.status}")
                     payload = await response.json()
-                models = payload.get("models", []) if isinstance(payload, dict) else []
+                models = payload.get("models") if isinstance(payload, dict) else None
+                if not isinstance(models, list):
+                    raise BackendUnavailable("Ollama /api/ps returned an invalid model list")
                 for model in models:
                     name = model.get("name") or model.get("model") if isinstance(model, dict) else None
                     if name:
                         async with session.post(f"{upstream.rstrip('/')}/api/generate", json={"model": name, "keep_alive": 0}) as response:
                             if response.status >= 300:
                                 raise BackendUnavailable(f"Ollama refused to unload {name}")
-                async with session.get(f"{upstream.rstrip('/')}/api/ps") as response:
-                    remaining = await response.json()
-                if isinstance(remaining, dict) and remaining.get("models"):
-                    raise BackendUnavailable("Ollama models remain resident after unload")
+                deadline = asyncio.get_running_loop().time() + 30
+                while asyncio.get_running_loop().time() < deadline:
+                    async with session.get(f"{upstream}/api/ps") as response:
+                        if response.status >= 300:
+                            raise BackendUnavailable(f"Ollama /api/ps returned HTTP {response.status}")
+                        remaining = await response.json()
+                    remaining_models = remaining.get("models") if isinstance(remaining, dict) else None
+                    if not isinstance(remaining_models, list):
+                        raise BackendUnavailable("Ollama /api/ps returned an invalid model list")
+                    if not remaining_models:
+                        return
+                    await asyncio.sleep(0.5)
+                raise BackendUnavailable("Ollama models remain resident after unload")
+            except BackendUnavailable:
+                raise
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError, json.JSONDecodeError) as exc:
                 raise BackendUnavailable(f"Could not verify Ollama unload: {exc}") from exc
 
@@ -329,7 +426,8 @@ class BackendManager:
     async def stop_comfyui(self) -> None:
         async with self._lock:
             if self._process is None:
-                if await self._ready():
+                _ready, reachable = await self._probe_comfyui()
+                if reachable:
                     self._set_state("blocked")
                     self.ownership = "external"
                     self.blocked_reason = "External ComfyUI is running; the proxy will not stop it"
@@ -338,6 +436,11 @@ class BackendManager:
                 return
             self._set_state("stopping")
             await self._terminate_owned()
+            _ready, reachable = await self._probe_comfyui()
+            if reachable:
+                self.blocked_reason = "ComfyUI endpoint remains active after stopping the managed process"
+                self._set_state("blocked")
+                raise BackendUnavailable(self.blocked_reason)
             self._set_state("stopped")
 
     async def _terminate_owned(self) -> None:

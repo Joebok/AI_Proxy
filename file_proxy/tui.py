@@ -156,12 +156,31 @@ class ProxyDashboard(App[None]):
             state_lines.append(f"Backend: {escape(snapshot.active_backend)}")
         if snapshot.active_job:
             state_lines.append(f"Job: {escape(snapshot.active_job)}")
-        if snapshot.backend_status:
-            backend_state = str(snapshot.backend_status.get("state") or "unknown")
-            ownership = str(snapshot.backend_status.get("ownership") or "unknown")
+        health = snapshot.backend_health or {}
+        ollama = health.get("ollama") if isinstance(health, dict) else None
+        if isinstance(ollama, dict):
+            ollama_state = "ONLINE" if ollama.get("reachable") else "OFFLINE"
+            models = ollama.get("loaded_models") or []
+            model_labels = []
+            for model in models:
+                if isinstance(model, dict):
+                    name = str(model.get("name") or "unknown")
+                    vram = int(model.get("size_vram") or 0)
+                    label = f"{name} ({vram / (1024 ** 3):.1f} GiB VRAM)" if vram else name
+                else:
+                    label = str(model)
+                model_labels.append(label)
+            model_text = ", ".join(model_labels) if model_labels else "none"
+            state_lines.append(f"Ollama: {ollama_state}; VRAM models: {escape(model_text)}")
+        comfyui = health.get("comfyui") if isinstance(health, dict) else None
+        if isinstance(comfyui, dict):
+            reachable = "online" if comfyui.get("reachable") else "offline"
+            endpoint_ready = comfyui.get("endpoint_ready")
+            endpoint_state = "ready" if endpoint_ready else reachable
+            ownership = str(comfyui.get("ownership") or "unknown")
             ownership_label = "managed" if ownership == "proxy" else ownership
             state_lines.append(
-                f"ComfyUI backend: {escape(backend_state)} ({escape(ownership_label)})"
+                f"ComfyUI: {escape(endpoint_state)} ({escape(ownership_label)})"
             )
         if snapshot.error:
             state_lines.append(f"[red]{escape(snapshot.error)}[/red]")
@@ -171,6 +190,10 @@ class ProxyDashboard(App[None]):
             state_lines.append(
                 f"[orange1]{escape(str(snapshot.backend_status['blocked_reason']))}[/orange1]"
             )
+        elif isinstance(ollama, dict) and ollama.get("error"):
+            state_lines.append(f"[orange1]Ollama: {escape(str(ollama['error']))}[/orange1]")
+        elif isinstance(comfyui, dict) and comfyui.get("health_error"):
+            state_lines.append(f"[orange1]ComfyUI: {escape(str(comfyui['health_error']))}[/orange1]")
         elif snapshot.cache_status and snapshot.cache_status.get("error"):
             state_lines.append(
                 f"[orange1]Cache: {escape(str(snapshot.cache_status['error']))}[/orange1]"
@@ -188,25 +211,8 @@ class ProxyDashboard(App[None]):
                     f"{escape(profile_label)} proxy  {escape(listener.host)}:{listener.port}  "
                     f"[{listener_color}]{listener.state.upper()}[/{listener_color}]"
                 )
-            managed = bool(
-                snapshot.backend_status
-                and snapshot.backend_status.get("ownership") == "proxy"
-            )
-            has_comfyui_proxy = any(
-                listener.profile == "comfyui" for listener in snapshot.listeners
-            )
-            if managed and not has_comfyui_proxy:
-                listener_lines.append("[red]ComfyUI proxy  NOT CONFIGURED[/red]")
-            elif managed and snapshot.backend_status:
-                backend_state = str(snapshot.backend_status.get("state") or "unknown")
-                backend_note = " (on demand)" if backend_state == "stopped" else ""
-                backend_color = STATE_COLORS.get(backend_state, "white")
-                listener_lines.append(
-                    f"ComfyUI backend  [{backend_color}]{escape(backend_state.upper())}[/{backend_color}]"
-                    f"{backend_note}"
-                )
         else:
-            listener_lines = ["[bold]PROXY LISTENERS[/bold]", "Filesystem mode", "No HTTP ports configured"]
+            listener_lines = ["[bold]PROXY LISTENERS[/bold]", "File proxy mode", "No HTTP ports configured"]
         self.query_one("#listeners", Static).update("\n".join(listener_lines))
 
         count = snapshot.filesystem_counts

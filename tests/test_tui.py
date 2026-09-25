@@ -12,8 +12,9 @@ from textual.widgets import RichLog, Static
 from file_proxy.cli import parser
 from file_proxy.engine import Proxy
 from file_proxy.http_proxy import HttpProxyConfig, OLLAMA_PROFILE
+from file_proxy.models import WorkerRegistration
 from file_proxy.registry import Registry
-from file_proxy.runtime import RuntimeConfig
+from file_proxy.runtime import ManagedComfyUIConfig, RuntimeConfig
 from file_proxy.supervisor import (
     ListenerSnapshot,
     LogEntry,
@@ -57,6 +58,59 @@ def test_filesystem_runtime_stops_restarts_and_releases_lock(tmp_path: Path) -> 
         assert lock.is_file()
         await supervisor.stop()
         assert not lock.exists()
+
+    asyncio.run(scenario())
+
+
+def test_managed_file_only_runtime_uses_backend_scheduler(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime_dir = tmp_path / "runtime"
+        worker = tmp_path / "worker.py"
+        worker.write_text(
+            "import argparse, pathlib\n"
+            "parser=argparse.ArgumentParser(); parser.add_argument('--job-dir'); args=parser.parse_args()\n"
+            "pathlib.Path(args.job_dir, 'output.txt').write_text('processed', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        registry = Registry({"zet": {"ollama": WorkerRegistration(
+            command=(sys.executable, str(worker)), timeout_seconds=5, backend="ollama"
+        )}})
+        proxy = Proxy(tmp_path / "queue", registry, local_runtime_dir=runtime_dir)
+        queued = proxy.ask_root / "zet" / "file-only-job"
+        queued.mkdir(parents=True)
+        (queued / "job.json").write_text(json.dumps({
+            "protocol_version": 1,
+            "job_id": "file-only-job",
+            "subscriber_id": "zet",
+            "worker": "ollama",
+            "created_at": "2026-01-01T00:00:00Z",
+            "resource_key": "ollama:smoke",
+        }), encoding="utf-8")
+        supervisor = RuntimeSupervisor(
+            proxy,
+            [],
+            RuntimeConfig(
+                runtime_dir=str(runtime_dir),
+                managed_comfyui=ManagedComfyUIConfig(
+                    enabled=True,
+                    executable=sys.executable,
+                    working_directory=str(tmp_path),
+                    upstream=f"http://127.0.0.1:{unused_port()}",
+                ),
+            ),
+            poll_seconds=0.01,
+        )
+        assert await supervisor.start()
+        answer = proxy.answer_root / "zet" / "file-only-job"
+        for _ in range(500):
+            if answer.is_dir():
+                break
+            await asyncio.sleep(0.01)
+        assert (answer / "output.txt").read_text(encoding="utf-8") == "processed"
+        assert not supervisor.configs
+        assert supervisor._http_state is not None
+        assert supervisor._http_state.backend_manager is not None
+        assert await supervisor.stop()
 
     asyncio.run(scenario())
 
@@ -223,6 +277,10 @@ class FakeSupervisor:
             },
             cache_status=None,
             logs=(LogEntry(1, datetime.now().astimezone(), "test", "success", "Ready for work"),),
+            backend_health={
+                "ollama": {"reachable": True, "loaded_models": ["image-analysis-alt"]},
+                "comfyui": {"reachable": True, "endpoint_ready": True, "ownership": "proxy"},
+            },
         )
 
 
@@ -237,8 +295,11 @@ def test_dashboard_renders_status_log_and_shortcuts() -> None:
             queues = app.query_one("#queues", Static)
             assert state.has_class("state-ready")
             listener_text = str(listeners.render())
-            assert "ComfyUI proxy" in listener_text
-            assert "on demand" in listener_text
+            assert "NOT CONFIGURED" not in listener_text
+            state_text = str(state.render())
+            assert "Ollama: ONLINE" in state_text
+            assert "image-analysis-alt" in state_text
+            assert "ComfyUI: ready (managed)" in state_text
             assert listeners.content_region.height >= 7
             assert "Filesystem" in str(queues.render())
             assert len(app.query_one("#log", RichLog).lines) == 1
@@ -279,6 +340,6 @@ def test_tui_cli_matches_run_options_and_launchers_select_it() -> None:
     )
     root = Path(__file__).parents[1]
     assert '@("tui", "--sync-grace-seconds"' in (root / "run_file_proxy.ps1").read_text()
-    assert "--external-comfyui" in (root / "run_file_proxy.ps1").read_text()
+    assert "--external-comfyui" not in (root / "run_file_proxy.ps1").read_text()
     assert " tui --sync-grace-seconds " in (root / "run_file_proxy.bat").read_text()
-    assert "--external-comfyui" in (root / "run_file_proxy.bat").read_text()
+    assert "--external-comfyui" not in (root / "run_file_proxy.bat").read_text()

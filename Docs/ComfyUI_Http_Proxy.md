@@ -1,4 +1,9 @@
-# Managed ComfyUI HTTP contract
+# Managed ComfyUI lifecycle and optional HTTP contract
+
+The standard Zet workflow stages render work through AI_Proxy's filesystem
+queue. Managed process ownership and Ollama coordination work without a
+ComfyUI HTTP listener. The listener described below is an optional separate
+API mode; the standard launchers do not enable it.
 
 AI Proxy exposes separate Ollama and ComfyUI listeners backed by one execution
 arbiter. HTTP work has strict priority over filesystem work, active work is
@@ -21,7 +26,9 @@ with the proxy. A live server at the managed address that is not owned by this
 proxy is treated as a manual-instance conflict and is never terminated.
 
 Before managed ComfyUI starts, resident Ollama models are unloaded and `/api/ps`
-is checked. Before Ollama work, owned ComfyUI is stopped and its exit confirmed.
+is checked until no models remain. Before Ollama work, owned ComfyUI is stopped
+and its endpoint is confirmed closed. ComfyUI readiness uses `/queue`, avoiding
+the CUDA memory query in `/system_stats`.
 Consecutive image operations reuse ComfyUI; it stops after the configured idle
 interval. Startup has one attempt per request and a cooldown after failure.
 
@@ -39,8 +46,9 @@ history becomes visible there, so both routes continue working after managed
 ComfyUI stops or AI Proxy restarts. `/api` aliases are supported. Original
 ComfyUI output files are never deleted.
 
-`GET /_proxy/status` is available on both listeners and reports queue age,
-affinity, backend ownership, cache use, and filesystem degradation.
+`GET /_proxy/status` on an enabled HTTP listener reports queue age, affinity,
+Ollama model residency, ComfyUI endpoint and ownership, cache use, and
+filesystem degradation.
 `GET /_proxy/jobs/{request_id}` returns a durable lifecycle outcome.
 
 Discovery and upload calls are scheduler-controlled in managed mode because
@@ -73,9 +81,10 @@ path and do not close API listeners.
 inspected standalone ComfyUI Python, source tree, shared input/output folders,
 and Desktop-generated model-path file. It ships with `enabled: false`; copy it
 to a local private path and enable it only after machine acceptance. Configure
-Zet to submit and retrieve through the proxy listener. Do not point Comfy
-Desktop itself at that listener or start Desktop while managed mode owns port
-8188.
+For the optional HTTP API, configure the client to submit and retrieve through
+the proxy listener. For file-proxy renders, keep Zet configured for the ComfyUI
+backend endpoint (`127.0.0.1:8188`) and leave ComfyUI Desktop closed while
+managed mode owns that port.
 
 Rollback is simply disabling managed mode and starting ComfyUI manually.
 Installed models and original output files are unchanged.

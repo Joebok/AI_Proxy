@@ -30,7 +30,7 @@ $proxyArgs = @(
 if ($env:AI_PROXY_RUNTIME_CONFIG) {
     $proxyArgs += @("--runtime-config", $env:AI_PROXY_RUNTIME_CONFIG)
 }
-$proxyArgs += @("tui", "--sync-grace-seconds", $env:FILE_PROXY_SYNC_GRACE_SECONDS, "--external-comfyui")
+$proxyArgs += @("tui", "--sync-grace-seconds", $env:FILE_PROXY_SYNC_GRACE_SECONDS)
 if ($env:AI_PROXY_HTTP_PORT) {
     $proxyArgs += @(
         "--http-listen-host", $(if ($env:AI_PROXY_HTTP_HOST) { $env:AI_PROXY_HTTP_HOST } else { "127.0.0.1" }),

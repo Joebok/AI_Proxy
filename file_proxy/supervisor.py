@@ -45,6 +45,7 @@ class RuntimeSnapshot:
     backend_status: dict[str, object] | None
     cache_status: dict[str, object] | None
     logs: tuple[LogEntry, ...]
+    backend_health: dict[str, object] | None = None
 
 
 class RuntimeSupervisor:
@@ -117,7 +118,7 @@ class RuntimeSupervisor:
         self.proxy._filesystem_degraded = None
         self.log("dashboard", "Starting proxy runtime.")
         try:
-            if self.configs:
+            if self.configs or self.runtime_config.managed_comfyui.enabled:
                 state = HttpRuntimeState()
                 self._http_state = state
                 self._task = asyncio.create_task(
@@ -171,7 +172,7 @@ class RuntimeSupervisor:
                 self.log(
                     "dashboard",
                     "Managed ComfyUI backend is stopped until a ComfyUI job arrives; "
-                    "the proxy listener remains ready.",
+                    + ("configured listeners are ready." if self.configs else "the file scheduler is ready."),
                 )
             if self._task is not None:
                 self._task.add_done_callback(self._runtime_done)
@@ -282,6 +283,7 @@ class RuntimeSupervisor:
         queue = http_state.queue.snapshot() if http_state and http_state.queue else {}
         manager = http_state.backend_manager if http_state else None
         backend_status = manager.status() if manager else None
+        backend_health = await manager.health_status() if manager else None
         store = http_state.store if http_state else None
         cache_status: dict[str, object] | None = None
         if store:
@@ -359,4 +361,5 @@ class RuntimeSupervisor:
             backend_status=backend_status,
             cache_status=cache_status,
             logs=logs,
+            backend_health=backend_health,
         )

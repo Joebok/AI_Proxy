@@ -80,6 +80,37 @@ def test_terminal_comfyui_error_is_not_recorded_as_success(tmp_path: Path) -> No
     asyncio.run(scenario())
 
 
+def test_proxy_status_adds_backend_health_without_removing_existing_fields(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        comfy_port = unused_port()
+        ollama_port = unused_port()
+        manager = BackendManager(
+            ManagedComfyUIConfig(enabled=False, upstream=f"http://127.0.0.1:{comfy_port}"),
+            tmp_path / "runtime",
+            lambda _message: None,
+            f"http://127.0.0.1:{ollama_port}",
+        )
+        service = HttpProxyService(
+            HttpProxyConfig(listen_port=unused_port(), profile=COMFYUI_PROFILE),
+            HttpQueue(),
+            lambda _message: None,
+            backend_manager=manager,
+        )
+        await service.start()
+        try:
+            async with ClientSession() as client:
+                async with client.get(f"http://127.0.0.1:{service.config.listen_port}/_proxy/status") as response:
+                    payload = await response.json()
+            assert payload["backend"] == "comfyui"
+            assert "queue" in payload and "backend_runtime" in payload
+            assert payload["backends"]["comfyui"]["endpoint_ready"] is False
+            assert payload["backends"]["ollama"]["reachable"] is False
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
 def test_runtime_config_is_opt_in_and_validates_unknown_keys(tmp_path: Path) -> None:
     assert not RuntimeConfig.load(None).managed_comfyui.enabled
     path = tmp_path / "runtime.json"
@@ -173,7 +204,7 @@ def test_managed_backend_starts_hidden_and_stops_disposable_process(tmp_path: Pa
             "import sys\n"
             "class H(BaseHTTPRequestHandler):\n"
             " def do_GET(self):\n"
-            "  self.send_response(200 if self.path == '/system_stats' else 404); self.end_headers(); self.wfile.write(b'{}')\n"
+            "  self.send_response(500 if self.path == '/system_stats' else 200 if self.path == '/queue' else 404); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(b'{\"queue_running\":[],\"queue_pending\":[]}' if self.path == '/queue' else b'{}')\n"
             " def log_message(self,*args): pass\n"
             "HTTPServer(('127.0.0.1',int(sys.argv[1])),H).serve_forever()\n",
             encoding="utf-8",
@@ -195,6 +226,8 @@ def test_managed_backend_starts_hidden_and_stops_disposable_process(tmp_path: Pa
         await manager.ensure_comfyui()
         pid = manager.status()["pid"]
         assert isinstance(pid, int) and manager.state == "ready"
+        status = await manager.health_status()
+        assert status["comfyui"]["endpoint_ready"] is True
         await manager.stop_comfyui()
         assert manager.status()["pid"] is None and manager.state == "stopped"
 
@@ -203,11 +236,11 @@ def test_managed_backend_starts_hidden_and_stops_disposable_process(tmp_path: Pa
 
 def test_managed_backend_never_adopts_manual_listener(tmp_path: Path) -> None:
     async def scenario() -> None:
-        async def stats(_request: web.Request) -> web.Response:
-            return web.json_response({})
+        async def queue(_request: web.Request) -> web.Response:
+            return web.json_response({"queue_running": [], "queue_pending": []})
 
         app = web.Application()
-        app.router.add_get("/system_stats", stats)
+        app.router.add_get("/queue", queue)
         runner = web.AppRunner(app)
         await runner.setup()
         port = unused_port()
@@ -221,6 +254,36 @@ def test_managed_backend_never_adopts_manual_listener(tmp_path: Path) -> None:
             with pytest.raises(BackendUnavailable, match="manually started"):
                 await manager.ensure_comfyui()
             assert manager.ownership == "external" and manager.state == "blocked"
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_ollama_models_are_unloaded_and_verified_before_comfyui(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        state = {"models": [{"name": "image-analysis-alt"}]}
+
+        async def ps(_request: web.Request) -> web.Response:
+            return web.json_response(state)
+
+        async def unload(_request: web.Request) -> web.Response:
+            state["models"] = []
+            return web.json_response({"done": True})
+
+        app = web.Application()
+        app.router.add_get("/api/ps", ps)
+        app.router.add_post("/api/generate", unload)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        port = unused_port()
+        await web.TCPSite(runner, "127.0.0.1", port).start()
+        manager = BackendManager(
+            ManagedComfyUIConfig(enabled=True), tmp_path / "runtime", lambda _message: None
+        )
+        try:
+            await manager._unload_ollama(f"http://127.0.0.1:{port}")
+            assert state["models"] == []
         finally:
             await runner.cleanup()
 

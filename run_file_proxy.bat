@@ -27,4 +27,4 @@ if defined AI_PROXY_HTTP_PORT (
   set "HTTP_ARGS=--http-listen-host %AI_PROXY_HTTP_HOST% --http-listen-port %AI_PROXY_HTTP_PORT% --ollama-upstream %AI_PROXY_OLLAMA_UPSTREAM% --http-continuation-grace-seconds %AI_PROXY_HTTP_CONTINUATION_GRACE_SECONDS% --http-max-body-bytes %AI_PROXY_HTTP_MAX_BODY_BYTES% --http-upstream-timeout-seconds %AI_PROXY_HTTP_UPSTREAM_TIMEOUT_SECONDS%"
 )
 echo Starting File Proxy...
-"%VENV_PYTHON%" -m file_proxy.cli --root "%AI_QUEUE_ROOT%" --registry-dir "%~dp0registries" %RUNTIME_ARGS% tui --sync-grace-seconds "%FILE_PROXY_SYNC_GRACE_SECONDS%" --external-comfyui %HTTP_ARGS%
+"%VENV_PYTHON%" -m file_proxy.cli --root "%AI_QUEUE_ROOT%" --registry-dir "%~dp0registries" %RUNTIME_ARGS% tui --sync-grace-seconds "%FILE_PROXY_SYNC_GRACE_SECONDS%" %HTTP_ARGS%

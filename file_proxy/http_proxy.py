@@ -685,6 +685,7 @@ class HttpProxyService:
             data: dict[str, object] = {"backend": self.profile.name, "queue": self.queue.snapshot()}
             if self.backend_manager:
                 data["backend_runtime"] = self.backend_manager.status()
+                data["backends"] = await self.backend_manager.health_status()
             if self.store:
                 data["cache"] = {**self.store.status(), "error": self._cache_error}
             if self.status_provider:
@@ -1178,7 +1179,7 @@ async def run_http_proxies(
     runtime_config: RuntimeConfig | None = None,
     runtime_state: HttpRuntimeState | None = None,
 ) -> None:
-    if not configs:
+    if not configs and not (runtime_config and runtime_config.managed_comfyui.enabled):
         raise ValueError("At least one HTTP listener configuration is required")
     for config in configs:
         config.validate()
@@ -1209,7 +1210,15 @@ async def run_http_proxies(
         if runtime
         else None
     )
-    manager = BackendManager(runtime.managed_comfyui, Path(runtime.runtime_dir), logger) if runtime else None
+    ollama_upstream = next(
+        (config.upstream for config in configs if config.profile.name == "ollama"),
+        "http://127.0.0.1:11434",
+    )
+    manager = (
+        BackendManager(runtime.managed_comfyui, Path(runtime.runtime_dir), logger, ollama_upstream)
+        if runtime
+        else None
+    )
     admission = AdmissionController(
         runtime.max_admitted_requests if runtime else min(c.max_admitted_requests for c in configs),
         runtime.max_buffered_body_bytes if runtime else min(c.max_buffered_body_bytes for c in configs),
@@ -1279,8 +1288,9 @@ async def run_http_proxies(
                 started.append(service)
                 if runtime_state is not None:
                     runtime_state.listener_states[service.profile.name] = "listening"
-            reconciliation_service = next((service for service in services if service.profile.name == "comfyui"), services[0])
-            await reconciliation_service.reconcile_records()
+            if services:
+                reconciliation_service = next((service for service in services if service.profile.name == "comfyui"), services[0])
+                await reconciliation_service.reconcile_records()
             if runtime_state is not None:
                 runtime_state.ready.set()
         except BaseException:
@@ -1296,12 +1306,15 @@ async def run_http_proxies(
                 if runtime_state is not None:
                     runtime_state.listener_states[service.profile.name] = "stopped"
             raise
-        grace = max(config.continuation_grace_seconds for config in configs)
+        grace = max((config.continuation_grace_seconds for config in configs), default=0.0)
         try:
-            logger(
-                "Ready; HTTP requests have priority over filesystem jobs for "
-                f"{len(services)} listener(s). Press Ctrl-C to stop."
-            )
+            if services:
+                logger(
+                    "Ready; HTTP requests have priority over filesystem jobs for "
+                    f"{len(services)} listener(s). Press Ctrl-C to stop."
+                )
+            else:
+                logger("Ready; managed file scheduler is active. Press Ctrl-C to stop.")
             await proxy.run_scheduler(
                 queue,
                 poll_seconds=poll_seconds,

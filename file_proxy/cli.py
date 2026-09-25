@@ -153,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
             configs = _http_configs(args, runtime, comfyui_upstream)
         if args.command == "run":
             try:
-                if not configs:
+                if not configs and not runtime.managed_comfyui.enabled:
                     proxy.run(args.poll_seconds)
                 else:
                     asyncio.run(
