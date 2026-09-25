@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 import socket
 
@@ -8,6 +9,7 @@ from aiohttp import ClientSession, web
 import pytest
 
 from file_proxy.engine import Proxy
+from file_proxy.diagnostics import RequestDiagnosticLog
 from file_proxy.http_proxy import (
     HttpProxyConfig,
     HttpProxyService,
@@ -16,6 +18,7 @@ from file_proxy.http_proxy import (
 )
 from file_proxy.registry import Registry
 from file_proxy.scheduler import HttpQueue
+from file_proxy.store import ExecutionStore
 
 
 def unused_port() -> int:
@@ -336,6 +339,8 @@ def test_client_disconnect_closes_running_upstream(tmp_path: Path) -> None:
 
         queue = HttpQueue()
         proxy = make_proxy(tmp_path)
+        store = ExecutionStore(tmp_path / "runtime")
+        diagnostics = RequestDiagnosticLog(tmp_path / "runtime", retention_days=3)
         proxy_port = unused_port()
         service = HttpProxyService(
             HttpProxyConfig(
@@ -346,6 +351,8 @@ def test_client_disconnect_closes_running_upstream(tmp_path: Path) -> None:
             ),
             queue,
             lambda _message: None,
+            store=store,
+            diagnostic_log=diagnostics,
         )
         await service.start()
         scheduler = asyncio.create_task(
@@ -357,8 +364,26 @@ def test_client_disconnect_closes_running_upstream(tmp_path: Path) -> None:
                     f"http://127.0.0.1:{proxy_port}/api/chat", data=b"{}"
                 )
                 assert await asyncio.wait_for(response.content.readline(), 1) == b'{"done":false}\n'
+                request_id = response.headers["X-AI-Proxy-Request-ID"]
                 response.close()
                 await asyncio.wait_for(upstream_cancelled.wait(), 1)
+                for _ in range(20):
+                    record = store.get(request_id)
+                    if record and record["state"] != "dispatched":
+                        break
+                    await asyncio.sleep(0.01)
+                assert record["state"] == "cancelled"
+                assert record["outcome"] == "downstream_disconnected"
+                entries = [
+                    json.loads(line)
+                    for path in diagnostics.directory.glob("requests-*.jsonl")
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                ]
+                terminal = [entry for entry in entries if entry["event"] == "terminal"]
+                assert terminal[0]["request_id"] == request_id
+                assert terminal[0]["termination"] == "downstream_disconnected"
+                assert terminal[0]["chunks"] == 1
+                assert terminal[0]["bytes"] == len(b'{"done":false}\n')
         finally:
             scheduler.cancel()
             try:

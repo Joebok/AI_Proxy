@@ -741,6 +741,13 @@ accept `AI_PROXY_HTTP_HOST`, `AI_PROXY_OLLAMA_UPSTREAM`,
 memory-only and are never replayed. Accepted lifecycle outcomes and archived
 ComfyUI results are durable in the configured local runtime directory.
 
+The runtime also writes body-free HTTP stream diagnostics as daily JSONL files
+under `request-diagnostics`. Records include request identity, elapsed time,
+upstream status, streamed byte/chunk counts, and the terminal transport reason;
+headers and request/response bodies are never logged. Files roll daily and the
+runtime removes files older than `diagnostic_log_retention_days` (three days by
+default).
+
 ## Reliable ComfyUI lifecycle
 
 Add `--comfyui-listen-port 18188` to expose the queued ComfyUI API beside the

@@ -26,6 +26,7 @@
   "max_admitted_requests": 32,
   "max_buffered_body_bytes": 268435456,
   "retention_days": 7,
+  "diagnostic_log_retention_days": 3,
   "cache_max_bytes": 10737418240,
   "max_resource_streak": 5,
   "oldest_request_seconds": 60

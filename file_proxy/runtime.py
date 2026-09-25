@@ -35,6 +35,7 @@ class RuntimeConfig:
     max_admitted_requests: int = 32
     max_buffered_body_bytes: int = 256 * 1024 * 1024
     retention_days: int = 7
+    diagnostic_log_retention_days: int = 3
     cache_max_bytes: int = 10 * 1024 * 1024 * 1024
     max_resource_streak: int = 5
     oldest_request_seconds: float = 60.0
@@ -98,6 +99,7 @@ class RuntimeConfig:
             "max_admitted_requests": self.max_admitted_requests,
             "max_buffered_body_bytes": self.max_buffered_body_bytes,
             "retention_days": self.retention_days,
+            "diagnostic_log_retention_days": self.diagnostic_log_retention_days,
             "cache_max_bytes": self.cache_max_bytes,
             "max_resource_streak": self.max_resource_streak,
         }

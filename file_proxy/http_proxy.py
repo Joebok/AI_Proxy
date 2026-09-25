@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import time
 import zlib
 from typing import TYPE_CHECKING
 import uuid
@@ -18,6 +19,7 @@ from multidict import CIMultiDict
 
 from .scheduler import HttpQueue
 from .backend import BackendManager, BackendUnavailable
+from .diagnostics import RequestDiagnosticLog
 from .store import ExecutionStore
 from .runtime import RuntimeConfig
 from .reasoning_policy import ReasoningPolicyStore
@@ -216,6 +218,22 @@ class HttpProxyConfig:
             raise ValueError("HTTP listener and upstream cannot use the same address and port")
 
 
+@dataclass
+class StreamDiagnostics:
+    started_at: float = field(default_factory=time.monotonic)
+    upstream_status: int | None = None
+    response_started: bool = False
+    chunks: int = 0
+    bytes: int = 0
+    termination: str | None = None
+    error_type: str | None = None
+    error: str | None = None
+
+    @property
+    def elapsed_ms(self) -> int:
+        return round((time.monotonic() - self.started_at) * 1000)
+
+
 def parse_bypass_route(value: str) -> tuple[str, str]:
     try:
         method, path = value.split(maxsplit=1)
@@ -341,6 +359,7 @@ class HttpProxyService:
         backend_manager: BackendManager | None = None,
         status_provider: Callable[[], dict[str, object]] | None = None,
         reasoning_policies: ReasoningPolicyStore | None = None,
+        diagnostic_log: RequestDiagnosticLog | None = None,
         retention_days: int = 7,
         cache_max_bytes: int = 10 * 1024 * 1024 * 1024,
     ) -> None:
@@ -359,9 +378,23 @@ class HttpProxyService:
         self.backend_manager = backend_manager
         self.status_provider = status_provider
         self.reasoning_policies = reasoning_policies
+        self.diagnostic_log = diagnostic_log
         self.retention_days = retention_days
         self.cache_max_bytes = cache_max_bytes
         self._cache_error: str | None = None
+        self._diagnostic_error: str | None = None
+
+    def _write_diagnostic(self, event: str, **details: object) -> None:
+        if self.diagnostic_log is None:
+            return
+        try:
+            self.diagnostic_log.write(event, **details)
+            self._diagnostic_error = None
+        except OSError as exc:
+            message = str(exc)
+            if message != self._diagnostic_error:
+                self.logger(f"Request diagnostic logging failed: {message}")
+                self._diagnostic_error = message
 
     def _route_is_queued(self, route: tuple[str, str]) -> bool:
         if self.profile.queue_all_except_bypass:
@@ -526,11 +559,33 @@ class HttpProxyService:
                 f"{request.method} {request.path}"
             )
             track_ollama = self.store is not None and self.profile.name == "ollama" and route in MODEL_ROUTES
+            stream_diagnostics = StreamDiagnostics() if track_ollama else None
             if track_ollama:
                 self.store.create(job.request_id, self.profile.name, None)
                 self.store.update(job.request_id, "dispatched")
+                self._write_diagnostic(
+                    "dispatched",
+                    request_id=job.request_id,
+                    backend=self.profile.name,
+                    method=request.method,
+                    path=request.path,
+                )
             try:
-                relayed = await self._relay(request, body, job.request_id)
+                relayed = await self._relay(request, body, job.request_id, stream_diagnostics)
+            except asyncio.CancelledError:
+                if track_ollama:
+                    termination = (
+                        stream_diagnostics.termination
+                        if stream_diagnostics and stream_diagnostics.termination
+                        else "handler_cancelled"
+                    )
+                    self.store.update(
+                        job.request_id,
+                        "cancelled",
+                        outcome=termination,
+                        error="request handler cancelled after upstream dispatch",
+                    )
+                raise
             except (aiohttp.ClientError, web.HTTPBadGateway, web.HTTPGatewayTimeout) as exc:
                 if track_ollama:
                     if self.backend_manager:
@@ -544,8 +599,44 @@ class HttpProxyService:
                     else:
                         self.store.update(job.request_id, "blocked", outcome="unresolved", error=str(exc))
                 raise
+            except Exception as exc:
+                if track_ollama:
+                    if stream_diagnostics:
+                        stream_diagnostics.termination = stream_diagnostics.termination or "unexpected_error"
+                        stream_diagnostics.error_type = type(exc).__name__
+                        stream_diagnostics.error = str(exc)
+                    self.store.update(
+                        job.request_id,
+                        "failed",
+                        outcome="unexpected_error",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                raise
+            finally:
+                if track_ollama and stream_diagnostics:
+                    self._write_diagnostic(
+                        "terminal",
+                        request_id=job.request_id,
+                        backend=self.profile.name,
+                        method=request.method,
+                        path=request.path,
+                        elapsed_ms=stream_diagnostics.elapsed_ms,
+                        upstream_status=stream_diagnostics.upstream_status,
+                        response_started=stream_diagnostics.response_started,
+                        chunks=stream_diagnostics.chunks,
+                        bytes=stream_diagnostics.bytes,
+                        termination=stream_diagnostics.termination or "completed",
+                        error_type=stream_diagnostics.error_type,
+                        error=stream_diagnostics.error,
+                    )
             if track_ollama:
-                self.store.update(job.request_id, "completed", outcome="succeeded")
+                outcome = (
+                    "upstream_completed_after_disconnect"
+                    if stream_diagnostics
+                    and stream_diagnostics.termination == "downstream_disconnected_drained"
+                    else "succeeded"
+                )
+                self.store.update(job.request_id, "completed", outcome=outcome)
             if self.store and relayed.status < 300 and route in {("POST", "/history"), ("POST", "/api/history")}:
                 try:
                     payload = json.loads(body or b"{}")
@@ -952,6 +1043,7 @@ class HttpProxyService:
         request: web.Request,
         body: bytes,
         request_id: str | None,
+        diagnostics: StreamDiagnostics | None = None,
     ) -> web.StreamResponse:
         assert self._session is not None
         url = f"{self._upstream}{request.raw_path}"
@@ -971,34 +1063,63 @@ class HttpProxyService:
                 data=body,
                 allow_redirects=False,
             ) as upstream:
+                if diagnostics:
+                    diagnostics.upstream_status = upstream.status
                 response_headers = CIMultiDict(_forward_headers(upstream.headers, request=False))
                 if request_id is not None:
                     response_headers["X-AI-Proxy-Request-ID"] = request_id
                 downstream = web.StreamResponse(status=upstream.status, headers=response_headers)
                 await downstream.prepare(request)
+                if diagnostics:
+                    diagnostics.response_started = True
                 async for chunk in upstream.content.iter_chunked(64 * 1024):
+                    if diagnostics:
+                        diagnostics.chunks += 1
+                        diagnostics.bytes += len(chunk)
                     await downstream.write(chunk)
                 await downstream.write_eof()
+                if diagnostics:
+                    diagnostics.termination = "completed"
                 if request_id is not None:
                     self.logger(f"Finished {self.profile.name} HTTP request {request_id}: {upstream.status}")
                 return downstream
         except asyncio.CancelledError:
             if downstream is not None:
+                if diagnostics:
+                    diagnostics.termination = "downstream_disconnected"
+                    diagnostics.error_type = "CancelledError"
+                    diagnostics.error = "downstream request handler was cancelled"
                 if self.profile.name == "ollama" and request_id is not None:
                     try:
-                        async for _chunk in upstream.content.iter_chunked(64 * 1024):
-                            pass
+                        async for chunk in upstream.content.iter_chunked(64 * 1024):
+                            if diagnostics:
+                                diagnostics.chunks += 1
+                                diagnostics.bytes += len(chunk)
+                        if diagnostics:
+                            diagnostics.termination = "downstream_disconnected_drained"
                         return downstream
-                    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-                        pass
+                    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                        if diagnostics:
+                            diagnostics.error_type = type(exc).__name__
+                            diagnostics.error = str(exc)
                 downstream.force_close()
             raise
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
+            if diagnostics:
+                diagnostics.termination = "upstream_timeout"
+                diagnostics.error_type = type(exc).__name__
+                diagnostics.error = str(exc)
             if downstream is None:
                 raise web.HTTPGatewayTimeout(text="upstream timed out") from None
             downstream.force_close()
             raise web.HTTPGatewayTimeout(text="upstream stream timed out ambiguously") from None
-        except (aiohttp.ClientError, ConnectionError):
+        except (aiohttp.ClientError, ConnectionError, OSError) as exc:
+            if diagnostics:
+                diagnostics.termination = (
+                    "stream_transport_error" if downstream is not None else "upstream_connection_error"
+                )
+                diagnostics.error_type = type(exc).__name__
+                diagnostics.error = str(exc)
             if downstream is None:
                 raise web.HTTPBadGateway(text="upstream request failed") from None
             downstream.force_close()
@@ -1080,6 +1201,14 @@ async def run_http_proxies(
     )
     logger = http_logger or proxy.logger
     store = ExecutionStore(Path(runtime.runtime_dir)) if runtime else None
+    diagnostic_log = (
+        RequestDiagnosticLog(
+            Path(runtime.runtime_dir),
+            retention_days=runtime.diagnostic_log_retention_days,
+        )
+        if runtime
+        else None
+    )
     manager = BackendManager(runtime.managed_comfyui, Path(runtime.runtime_dir), logger) if runtime else None
     admission = AdmissionController(
         runtime.max_admitted_requests if runtime else min(c.max_admitted_requests for c in configs),
@@ -1100,6 +1229,7 @@ async def run_http_proxies(
             backend_manager=manager,
             status_provider=proxy.status,
             reasoning_policies=reasoning_policies if config.profile.name == "ollama" else None,
+            diagnostic_log=diagnostic_log,
             retention_days=runtime.retention_days if runtime else 7,
             cache_max_bytes=runtime.cache_max_bytes if runtime else 10 * 1024 * 1024 * 1024,
         )
