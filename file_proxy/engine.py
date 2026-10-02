@@ -284,7 +284,12 @@ class Proxy:
                 except InvalidJob as exc:
                     self._not_ready_since.pop(job_dir, None)
                     invalid.append((job_dir, subscriber_dir.name, job_dir.name, str(exc)))
-        jobs.sort(key=lambda item: (item.manifest.created_at, item.manifest.subscriber_id, item.manifest.job_id))
+        jobs.sort(key=lambda item: (
+            -item.manifest.priority,
+            item.manifest.created_at,
+            item.manifest.subscriber_id,
+            item.manifest.job_id,
+        ))
         return jobs, invalid
 
     def _select_file_job(
@@ -325,6 +330,8 @@ class Proxy:
             if eligible and self._file_job_backend(job) != first_backend:
                 break
             eligible.append(job)
+        highest_priority = max(job.manifest.priority for job in eligible)
+        eligible = [job for job in eligible if job.manifest.priority == highest_priority]
         if resource_key is None:
             return eligible[0]
         if resource_streak < self.max_resource_streak:

@@ -63,6 +63,12 @@ def validate_resource_key(value: Any) -> str | None:
     return value
 
 
+def validate_priority(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+        raise InvalidJob("priority must be an integer between 0 and 100")
+    return value
+
+
 @dataclass(frozen=True)
 class JobManifest:
     protocol_version: int
@@ -72,6 +78,7 @@ class JobManifest:
     created_at: datetime
     files: tuple[dict[str, Any], ...] = ()
     resource_key: str | None = None
+    priority: int = 0
 
     @classmethod
     def from_dict(cls, data: Any) -> "JobManifest":
@@ -90,6 +97,7 @@ class JobManifest:
             created_at=parse_utc(data.get("created_at")),
             files=tuple(files),
             resource_key=validate_resource_key(data.get("resource_key")),
+            priority=validate_priority(data.get("priority", 0)),
         )
 
 

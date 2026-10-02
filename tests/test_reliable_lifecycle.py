@@ -12,7 +12,7 @@ import pytest
 
 from file_proxy.engine import Proxy
 from file_proxy.backend import BackendManager, BackendUnavailable
-from file_proxy.http_proxy import COMFYUI_PROFILE, HttpProxyConfig, HttpProxyService, _prepare_prompt_id, comfyui_resource_key
+from file_proxy.http_proxy import COMFYUI_PROFILE, HttpProxyConfig, HttpProxyService, _managed_output_path, _prepare_prompt_id, comfyui_resource_key
 from file_proxy.models import JobManifest
 from file_proxy.registry import Registry
 from file_proxy.runtime import ManagedComfyUIConfig, RuntimeConfig
@@ -24,6 +24,26 @@ def unused_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def test_managed_output_cleanup_resolves_only_files_inside_output_root(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    nested = output / "render"
+    nested.mkdir(parents=True)
+    owned = nested / "image.png"
+    owned.write_bytes(b"cached elsewhere")
+    arguments = ("--output-directory", str(output))
+
+    assert _managed_output_path(arguments, str(tmp_path), {
+        "filename": "image.png", "subfolder": "render", "type": "output",
+    }) == owned.resolve()
+    assert _managed_output_path(arguments, str(tmp_path), {
+        "filename": "../outside.png", "subfolder": "", "type": "output",
+    }) is None
+    assert _managed_output_path(arguments, str(tmp_path), {
+        "filename": "image.png", "subfolder": "", "type": "temp",
+    }) is None
+    assert owned.is_file()
 
 
 def test_prompt_ids_are_canonical_and_invalid_supplied_ids_are_rejected() -> None:

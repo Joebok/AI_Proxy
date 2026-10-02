@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import socket
 import time
 import zlib
@@ -260,6 +260,36 @@ def _same_endpoint(left: str, right: str) -> bool:
     except OSError:
         return left.casefold() == right.casefold()
     return bool(left_addresses & right_addresses)
+
+
+def _managed_output_path(arguments: tuple[str, ...], working_directory: str | None,
+                        artifact: dict[str, str]) -> Path | None:
+    """Resolve a reported artifact only inside the configured managed output tree."""
+    if artifact.get("type") != "output":
+        return None
+    filename = artifact.get("filename", "")
+    subfolder = artifact.get("subfolder", "")
+    posix, windows = PurePosixPath(filename), PureWindowsPath(filename)
+    folder_posix, folder_windows = PurePosixPath(subfolder), PureWindowsPath(subfolder)
+    if (not filename or posix.is_absolute() or windows.is_absolute() or
+            ".." in posix.parts or ".." in windows.parts or
+            folder_posix.is_absolute() or folder_windows.is_absolute() or
+            ".." in folder_posix.parts or ".." in folder_windows.parts):
+        return None
+    try:
+        index = arguments.index("--output-directory")
+        output_root = Path(arguments[index + 1])
+        if not output_root.is_absolute():
+            output_root = Path(working_directory or Path.cwd()) / output_root
+        output_root = output_root.resolve()
+        target = output_root.joinpath(*folder_posix.parts, *posix.parts)
+        resolved = target.resolve(strict=True)
+        resolved.relative_to(output_root)
+        if resolved.is_file() and not target.is_symlink():
+            return resolved
+    except (ValueError, IndexError, OSError):
+        return None
+    return None
 
 
 def _forward_headers(headers: CIMultiDict[str], *, request: bool) -> list[tuple[str, str]]:
@@ -989,6 +1019,8 @@ class HttpProxyService:
                         artifacts.append({"filename": filename, "subfolder": subfolder, "type": kind})
             for artifact in artifacts:
                 await self._archive_artifact(prompt_id, artifact)
+            if upstream_succeeded:
+                self._remove_managed_output_duplicates(prompt_id, artifacts)
             self.store.update(
                 request_id,
                 "completed" if upstream_succeeded else "failed",
@@ -1002,6 +1034,24 @@ class HttpProxyService:
             self._cache_error = str(exc)
             self.store.update(request_id, "failed", outcome="archive_failed", error=str(exc))
             raise BackendUnavailable(f"Could not preserve ComfyUI result: {exc}") from exc
+
+    def _remove_managed_output_duplicates(self, prompt_id: str, artifacts: list[dict[str, str]]) -> None:
+        """Delete only output files owned by the configured managed ComfyUI."""
+        manager = self.backend_manager
+        if not manager or not manager.config.enabled or manager.ownership != "proxy":
+            return
+        for artifact in artifacts:
+            cached = self.store.artifact(
+                prompt_id, artifact.get("filename", ""), artifact.get("subfolder", ""), artifact.get("type", "")
+            ) if self.store else None
+            if not cached or not cached.is_file() or cached.stat().st_size == 0:
+                continue
+            target = _managed_output_path(manager.config.arguments, manager.config.working_directory, artifact)
+            if target is not None:
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError:
+                    continue
 
     async def _archive_artifact(self, prompt_id: str, artifact: dict[str, str]) -> None:
         assert self._session is not None and self.store is not None
