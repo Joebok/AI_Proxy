@@ -719,7 +719,16 @@ class HttpProxyService:
             if self.store:
                 data["cache"] = {**self.store.status(), "error": self._cache_error}
             if self.status_provider:
-                data["filesystem"] = self.status_provider()
+                filesystem = self.status_provider()
+                runtime = data.get("backend_runtime") or {}
+                active_job = str(runtime.get("active_job") or "")
+                active_backend = runtime.get("active_backend")
+                for item in filesystem.get("jobs", []):
+                    item_id = f"{item.get('subscriber_id', '')}/{item.get('job_id', '')}"
+                    if item.get("status") == "running" and item_id == active_job:
+                        item["display_state"] = "sampling" if active_backend else "starting backend"
+                        item["trusted_worker_backend"] = item.get("trusted_worker_backend") or active_backend
+                data["filesystem"] = filesystem
             if self.profile.name == "ollama" and self.reasoning_policies:
                 self.reasoning_policies.refresh()
                 data["reasoning_policy"] = self.reasoning_policies.status()

@@ -1,0 +1,85 @@
+# Filesystem transport and one-job workers
+
+## Responsibility and interfaces
+
+The proxy validates eventually synced envelopes, runs one trusted local worker,
+and publishes a terminal answer. Subscriber business logic and harvesting remain
+outside this repo. Primary implementation: [engine.py](../../file_proxy/engine.py),
+[validation.py](../../file_proxy/validation.py), [registry.py](../../file_proxy/registry.py).
+Formats are owned by [DATA_MODEL.md](../DATA_MODEL.md); publisher/harvester examples
+by [README.md](../../README.md).
+
+Inputs: immutable `Ask/<subscriber>/<job>` with `job.json` and app payloads;
+trusted registry and process environment. Outputs: `Answer/<subscriber>/<job>`
+with `proxy_result.json` and complete non-hidden inventory. Public engine methods
+are `Proxy.once/run/process_once/status`; the async scheduler also calls selection
+and execution internals. `process_once` assumes its caller owns runtime coordination;
+`once` and `run` acquire the lock/recover first.
+
+## Workflow
+
+1. Subscriber creates hidden staging, writes/inventories material payloads, writes
+   manifest last, and publishes via same-filesystem rename. Hidden candidates are
+   ignored; no publisher service is implemented here.
+2. `_select_file_job` first republishes completed Running outcomes, then `_scan`
+   validates visible asks and registry membership. A missing/malformed manifest
+   or declared file mismatch raises `JobNotReady`: first-seen monotonic time is
+   remembered in memory until sync grace expires. Restart resets that timer.
+   Invalid contracts and malformed other JSON become `INVALID` answers.
+3. Selection returns either `QueueJob` or an invalid-job tuple. Invalid publication
+   does not acquire/start a backend. Valid ordering follows [SCHEDULING.md](SCHEDULING.md).
+4. Async managed execution prepares backend first; `_process_file_job` moves ask
+   to Running, prepares Forge when needed, records resource affinity, and scans
+   the file queue for advisory next-resource hints.
+5. `subprocess.run` uses registry argv + `--job-dir <absolute Running path>`,
+   configured cwd/timeout, `shell=False`, full stdout/stderr capture, inherited
+   environment plus three hints: `AI_PROXY_CURRENT_RESOURCE_KEY`,
+   `AI_PROXY_NEXT_JOB_PRESENT` (`1`/`0`), `AI_PROXY_NEXT_RESOURCE_KEY`.
+   Hints observe filesystem asks only; they are not reservations and do not
+   predict queued HTTP requests.
+6. Worker exit/timeout/launch failure maps to a terminal result. Missing job folder
+   is recreated with minimal identity metadata and failed; otherwise envelope
+   validation runs again, detecting mutated inventoried inputs and unsafe JSON.
+7. Build full non-hidden inventory; persist normal-worker outcome locally;
+   atomically write transport result; rename to Answer; remove local journal.
+   Answer collision raises rather than overwriting prior results.
+8. Subscriber validates full result inventory, copies artifacts durably, applies
+   business updates idempotently, then owns retention. Queue listings alone are
+   not an authoritative business state machine.
+
+## Recovery, error handling, and constraints
+
+`recover_interrupted` examines Running at startup: restore local journal into
+missing result, publish an existing result unchanged, otherwise publish FAILED
+`PROXY_INTERRUPTED`. It never reruns the worker. `_publish_completed_running`
+also retries already-recorded outcomes during polling. There is still a crash
+window after an external side effect and before a durable outcome; workers need
+idempotent effects per `(subscriber_id, job_id)`.
+
+Atomic replacements retry `PermissionError` with backoff for 15 seconds;
+inventory reads retry `OSError` for 15 seconds. Async scheduling records filesystem
+degradation for handled `OSError` paths while listeners remain up. Synchronous
+mode is not equally resilient to every moving/locked path; do not assume all scan,
+status, collision, or malformed recovery errors are caught. See development gaps.
+
+Registry commands are trusted code and are not sandboxed. Recursive path checks
+cover recognized JSON references and escaping symlinks, not arbitrary worker I/O.
+Worker contract: leave manifest/inputs intact, keep outputs inside envelope,
+close complete outputs before exit 0, write useful bounded diagnostics, do not
+poll/retry/move jobs. Captured logs are not truncated by the proxy.
+
+## Extension points and verification
+
+Add subscriber workers in local registry files, not in job-provided commands.
+Payload schema and prompt changes belong in the subscriber worker; only extend
+the manifest when transport/scheduling needs it. Inventory/identity changes affect
+publishers, workers, harvesters and recovery together.
+
+[test_proxy.py](../../tests/test_proxy.py) covers FIFO/affinity, hints, partial
+sync, invalid jobs, path safety, subprocess failures/timeouts, lock behavior,
+interrupted recovery, rename sharing violations and status. HTTP scheduler tests
+cover managed invalid publication/non-preemption; TUI tests cover stop waiting
+for workers. Full journal crash-window and real sync behavior remain unverified.
+
+Related contracts: [INVARIANTS.md](../INVARIANTS.md). Related reconstructed choice:
+[transport/local-state ADR](../DECISIONS/0001-transport-and-local-state.md).

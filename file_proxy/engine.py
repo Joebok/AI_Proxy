@@ -601,11 +601,11 @@ class Proxy:
                 if file_backend is None and selected.manifest.resource_key:
                     prefix = selected.manifest.resource_key.split(":", 1)[0]
                     file_backend = prefix if prefix in {"ollama", "comfyui"} else None
-            if backend_manager and backend_manager.config.enabled and file_backend is None:
+            if isinstance(selected, QueueJob) and backend_manager and backend_manager.config.enabled and file_backend is None:
                 self.logger("Filesystem worker is held: managed mode requires a trusted backend declaration")
                 await http_queue.wait(poll_seconds)
                 continue
-            if backend_manager:
+            if backend_manager and isinstance(selected, QueueJob):
                 try:
                     file_job_id = selected.manifest.job_id if isinstance(selected, QueueJob) else None
                     await backend_manager.prepare_for(file_backend, ollama_upstream=ollama_upstream, job_id=file_job_id)
@@ -623,7 +623,7 @@ class Proxy:
                 await worker_task
                 raise
             finally:
-                if backend_manager:
+                if backend_manager and isinstance(selected, QueueJob):
                     await backend_manager.released(file_backend)
 
     def run(self, poll_seconds: float = 1.0) -> None:
@@ -657,7 +657,7 @@ class Proxy:
         except OSError as exc:
             return {"counts": {}, "jobs": [], "degraded": str(exc)}
         counts = {"queued": 0, "running": 0, "succeeded": 0, "failed": 0, "invalid": 0}
-        items: list[dict[str, str]] = []
+        items: list[dict[str, Any]] = []
         for state, root in (("queued", self.ask_root), ("running", self.running_root), ("answer", self.answer_root)):
             for subscriber_dir in sorted(path for path in root.iterdir() if path.is_dir()):
                 if subscriber and subscriber_dir.name != subscriber:
@@ -666,12 +666,38 @@ class Proxy:
                     if job and job_dir.name != job:
                         continue
                     item_state = state
+                    item: dict[str, Any] = {
+                        "subscriber_id": subscriber_dir.name, "job_id": job_dir.name, "status": item_state,
+                        "display_state": "queued" if state == "queued" else "starting backend" if state == "running" else item_state,
+                        "diagnostic": "", "worker": "", "trusted_worker_backend": None,
+                    }
+                    if state in {"queued", "running"}:
+                        try:
+                            manifest_data = json.loads((job_dir / "job.json").read_text(encoding="utf-8"))
+                            manifest = JobManifest.from_dict(manifest_data)
+                            if manifest.subscriber_id != subscriber_dir.name or manifest.job_id != job_dir.name:
+                                raise InvalidJob("job identifiers do not match queue folder")
+                            registration = self.registry.worker(manifest.subscriber_id, manifest.worker)
+                            item["worker"] = manifest.worker
+                            if registration is None:
+                                item["diagnostic"] = f"Unknown trusted worker: {manifest.worker}"
+                            else:
+                                item["trusted_worker_backend"] = registration.backend
+                            validate_job_folder(job_dir, subscriber_dir.name, job_dir.name)
+                        except (InvalidJob, JobNotReady) as exc:
+                            item["diagnostic"] = str(exc)
+                        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                            item["diagnostic"] = f"Invalid job manifest: {exc}"
                     if state == "answer":
                         try:
                             result = json.loads((job_dir / "proxy_result.json").read_text(encoding="utf-8"))
                             item_state = str(result.get("status", "FAILED")).lower()
+                            item.update(status=item_state, worker=str(result.get("worker") or ""),
+                                         diagnostic=str(result.get("error_message") or ""))
+                            if item_state == "invalid":
+                                item["display_state"] = "held"
                         except (OSError, json.JSONDecodeError):
                             item_state = "failed"
                     counts[item_state] += 1
-                    items.append({"subscriber_id": subscriber_dir.name, "job_id": job_dir.name, "status": item_state})
+                    items.append(item)
         return {"counts": counts, "jobs": items, "degraded": self._filesystem_degraded}

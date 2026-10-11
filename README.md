@@ -9,10 +9,16 @@ application payload schema.
 This document is the integration contract for an AI agent adding proxy support
 to another application.
 
+For agents changing this repository, start with [AGENTS.md](AGENTS.md) and the
+[engineering knowledge index](Docs/INDEX.md). The index links implementation,
+contracts, validation, and planning guidance; this README owns subscriber
+integration examples.
+
 This is a personal project designed for my limited local resources to throttle 
 LLM and local image generation to one job at a time. It was particularly developed for the
-Zet project (https://github.com/Joebok/Zet) but has use more generally to manage local resources. Note also that 
-several machines can be connected to the queue to run jobs in parallel.
+Zet project (https://github.com/Joebok/Zet) but has use more generally to manage local resources.
+Assign one proxy worker machine per queue; parallel worker deployments require
+separate queues rather than multiple proxies consuming this queue.
 
 This project is provided "as-is". No promises of updates or backwards compatiblity.
 
@@ -50,11 +56,14 @@ inventory is locally present and valid before harvesting.
 
 ## Delivery and execution semantics
 
-- Jobs from every subscriber are initially ordered by `created_at`, then
-  `subscriber_id`, then `job_id`. Jobs with an optional matching `resource_key`
-  may run together for up to `--max-resource-streak` executions (five by
-  default), after which the oldest job using a different resource gets a turn.
-  Jobs without a resource key retain FIFO behavior.
+- Jobs from every subscriber are initially ordered by descending optional
+  `priority` (0 by default, range 0–100), then `created_at`, `subscriber_id`,
+  and `job_id`. Within the leading backend block at its highest priority,
+  matching `resource_key` jobs may be preferred up to `--max-resource-streak`
+  executions (five by default), then a different eligible resource gets a turn.
+  Affinity does not overtake an earlier different backend block. Equal-priority
+  jobs without a resource key retain FIFO behavior. See
+  [scheduler details](Docs/COMPONENTS/SCHEDULING.md).
 - Exactly one registered worker subprocess is launched at a time by the one
   designated proxy instance.
 - There is no automatic retry. A nonzero exit, timeout, launch failure, unsafe
@@ -67,8 +76,9 @@ inventory is locally present and valid before harvesting.
 - A crash after the worker caused an external side effect but before its answer
   was published is inherently ambiguous. Workers should be idempotent for a
   given `(subscriber_id, job_id)` or use their target system's idempotency key.
-- The singleton lock is an advisory local/Dropbox safety mechanism, not a
-  distributed lock. Operate exactly one proxy on one assigned worker machine.
+- The singleton lock is in the local runtime directory, not the synchronized
+  queue. It coordinates processes sharing that directory, not multiple machines
+  or runtime directories. Operate exactly one proxy on one assigned worker machine.
 
 These semantics are best described as single-attempt, eventually visible
 delivery—not exactly-once processing.
@@ -80,8 +90,11 @@ File_Proxy/
   Ask/<subscriber_id>/<job_id>/
   Running/<subscriber_id>/<job_id>/
   Answer/<subscriber_id>/<job_id>/
-  Control/proxy.lock
+  Control/
 ```
+
+The current singleton lock is `<runtime_dir>/proxy.lock`; `Control/` remains
+part of the queue layout but does not hold that lock.
 
 `--root` accepts either the parent queue directory or its `File_Proxy`
 subdirectory; both normalize to the same queue.
@@ -668,15 +681,16 @@ service is ignored and does not fail or log an error for the queued Ollama job.
 
 Continuous mode can also accept Ollama HTTP requests and schedule them with
 filesystem jobs. HTTP and filesystem work use separate queues. When the
-resource becomes free, the oldest HTTP request is selected first; otherwise the
-bounded resource-affinity policy selects a filesystem job. Active work is never
-preempted.
+resource becomes free, HTTP normally has preference, except that an already
+selected older filesystem job runs first when both backends are known and
+different. HTTP selection uses bounded affinity within the leading backend
+block, with control barriers and an oldest-wait override. Active work is never
+preempted. See [scheduler details](Docs/COMPONENTS/SCHEDULING.md).
 
 Queued Ollama and OpenAI-compatible inference requests derive an
-`ollama:<model>` resource key from their JSON body. HTTP requests still have
-priority and remain FIFO; after each runs, its key becomes the affinity used to
-select the next filesystem job. The proxy does not rewrite client-supplied
-`keep_alive` values.
+`ollama:<model>` resource key from their JSON body. After each starts, its key
+becomes the affinity used to select the next filesystem job. The proxy does not
+rewrite client-supplied `keep_alive` values.
 
 Each HTTP request holds the resource only from the start of its upstream Ollama
 request through the end of its response stream. Conversation state is not kept
@@ -725,16 +739,20 @@ through immediately:
 - `GET /api/version`
 - `GET /v1/models`
 
-Add another bypass with `--http-bypass-route "METHOD /path"`. Request and
-response bodies are forwarded without interpretation. Ollama NDJSON and
-OpenAI-compatible SSE responses are streamed incrementally.
+Add another bypass with `--http-bypass-route "METHOD /path"`. Ollama NDJSON and
+OpenAI-compatible SSE responses are streamed incrementally. Bodies are normally
+forwarded unchanged, with an optional alias-specific `reasoning_effort` mapping
+on `POST /v1/chat/completions` when `ollama_reasoning_policy_path` is configured.
+The proxy does not generate or merge task prompts. See
+[reasoning-policy behavior](Docs/COMPONENTS/REASONING_POLICY.md).
 
 After an HTTP response, the scheduler waits two seconds by default for a
 follow-up HTTP request before starting a filesystem job. Configure this with
 `--http-continuation-grace-seconds`. A follow-up arriving after a filesystem
 job starts waits for that job to finish.
 
-The launch scripts enable HTTP mode when `AI_PROXY_HTTP_PORT` is set. They also
+The launch scripts default `AI_PROXY_HTTP_PORT` to `11433`, enabling Ollama HTTP
+mode. Use the CLI directly for filesystem-only operation. They also
 accept `AI_PROXY_HTTP_HOST`, `AI_PROXY_OLLAMA_UPSTREAM`,
 `AI_PROXY_HTTP_CONTINUATION_GRACE_SECONDS`, `AI_PROXY_HTTP_MAX_BODY_BYTES`, and
 `AI_PROXY_HTTP_UPSTREAM_TIMEOUT_SECONDS`. Undispatched HTTP bodies remain
@@ -766,8 +784,9 @@ dashboard reports Ollama reachability and resident model names separately from
 ComfyUI process and endpoint status. `/_proxy/status` adds these details under
 `backends`. ComfyUI lifecycle readiness uses `/queue`; CUDA memory diagnostics
 from `/system_stats` do not decide whether a render succeeded. See
-[the managed ComfyUI contract](Docs/ComfyUI_Http_Proxy.md) for the optional
-queued HTTP API and managed process details.
+[managed runtime](Docs/COMPONENTS/MANAGED_RUNTIME.md) and
+[HTTP transport](Docs/COMPONENTS/HTTP_TRANSPORT.md) for the optional queued HTTP
+API, managed process details, and cache/managed-output retention behavior.
 
 ## Dropbox deployment
 
@@ -782,10 +801,12 @@ code.
 checkout by default; set `ZET_PROJECT_ROOT` and `AI_QUEUE_ROOT` for another
 machine layout.
 
-Run exactly one proxy for a queue. `Control/proxy.lock` records its hostname and
-will not be reclaimed by another host. Two machines started before either lock
-has synchronized can still race. Assign one worker machine and remove a
-foreign-host lock manually only after confirming that proxy is stopped.
+Run exactly one proxy for a queue. The local `<runtime_dir>/proxy.lock` records
+its hostname and refuses a foreign-host owner, but it is not synchronized and
+cannot prevent two machines or different runtime directories from consuming the
+same queue. Assign one worker machine and one shared local runtime directory for
+its proxy processes. Remove a stale lock manually only after confirming its
+owner is stopped.
 
 For a Zet cutover, stop old producers and workers, drain or archive
 `Ollama_Proxy`, then start `run_file_proxy.bat`. Do not copy old queue folders

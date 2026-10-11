@@ -440,3 +440,19 @@ def test_status_filters_jobs(tmp_path: Path) -> None:
     proxy.once()
     status = proxy.status(subscriber="zet", job="one")
     assert status["counts"]["succeeded"] == 1
+
+
+def test_status_exposes_validation_error_and_trusted_backend(tmp_path: Path) -> None:
+    proxy = make_proxy(tmp_path)
+    from dataclasses import replace
+    proxy.registry.subscribers["zet"]["mock"] = replace(proxy.registry.subscribers["zet"]["mock"], backend="comfyui")
+    job = publish(proxy.root, "malformed", created_at=datetime.now(timezone.utc).isoformat())
+    manifest_path = job / "job.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"] = [{"path": "", "size": 0, "sha256": "0" * 64}]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    item = proxy.status(subscriber="zet", job="malformed")["jobs"][0]
+
+    assert item["diagnostic"] == "referenced paths cannot be blank"
+    assert item["trusted_worker_backend"] == "comfyui"

@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,6 +35,38 @@ def test_http_queue_is_fifo(tmp_path: Path) -> None:
             queue.finish(first)
             await asyncio.wait_for(second.started, 1)
             queue.finish(second)
+        finally:
+            scheduler.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await scheduler
+
+    asyncio.run(scenario())
+
+
+def test_managed_scheduler_publishes_invalid_jobs_without_starting_backend(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        proxy = make_proxy(tmp_path)
+        invalid = (tmp_path / "invalid-job", "test", "invalid-job", "invalid input")
+        selections = [invalid]
+        proxy._select_file_job = lambda: selections.pop(0) if selections else None
+        processed = threading.Event()
+        proxy._process_file_job = lambda selected: processed.set() if selected == invalid else None
+
+        class ManagedBackend:
+            config = SimpleNamespace(enabled=True)
+
+            async def prepare_for(self, *_args, **_kwargs):
+                pytest.fail("Invalid jobs must not start a backend")
+
+            async def released(self, *_args):
+                pytest.fail("Invalid jobs did not acquire a backend")
+
+        scheduler = asyncio.create_task(proxy.run_scheduler(
+            HttpQueue(), poll_seconds=0.01, continuation_grace_seconds=0,
+            backend_manager=ManagedBackend(),
+        ))
+        try:
+            assert await asyncio.to_thread(processed.wait, 1)
         finally:
             scheduler.cancel()
             with pytest.raises(asyncio.CancelledError):
