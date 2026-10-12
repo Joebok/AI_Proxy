@@ -33,9 +33,9 @@ documentation records verified structure and explicitly labeled gaps.
 | Understand startup or add a subsystem | Architecture -> code map -> relevant component -> invariants |
 | Find a feature or debug a job | Code map -> file transport or HTTP transport -> development |
 | Change manifest, result, database, or settings | Data model -> invariants -> related component/tests |
-| Change ordering, priority, or affinity | Scheduling -> invariants -> HTTP scheduler and file proxy tests |
+| Change ordering, priority, or affinity | Scheduling -> invariants -> shared scheduler end-to-end scenario |
 | Change prompt generation | Subscriber worker owns it; read file transport, reasoning policy, and the transport ADR before choosing a boundary |
-| Change managed ComfyUI or dashboard | Managed runtime -> HTTP transport for prompts/cache -> lifecycle/TUI tests |
+| Change managed ComfyUI or dashboard | Managed runtime -> HTTP transport for prompts/cache -> functional lifecycle scenarios |
 | Plan a substantial refactor | Planning convention -> architecture -> impacted code-map rows and contracts |
 
 ## Evidence and retained notes

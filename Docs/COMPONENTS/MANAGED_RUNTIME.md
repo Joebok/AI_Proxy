@@ -89,13 +89,13 @@ scheduler backend resolution, CLI/TUI configuration and tests; a new name alone 
 insufficient. Dashboard additions should extend `RuntimeSnapshot`, keeping work in
 supervisor/manager rather than blocking rendering.
 
-[test_reliable_lifecycle.py](../../tests/test_reliable_lifecycle.py) verifies
-disposable hidden managed process startup/stop, manual listener refusal, Ollama
-unload and backend health/status. [test_tui.py](../../tests/test_tui.py) verifies
-file/managed mode, lock/restart/rebind, bind failure, worker completion before stop,
-dashboard rendering/shortcuts and CLI parity. [test_proxy.py](../../tests/test_proxy.py)
-checks Forge handoff/failure tolerance. Real GPU/Comfy Desktop/Dropbox and
-non-Windows process containment remain unverified.
+[ComfyUI lifecycle scenario](../../tests/test_e2e.py) verifies disposable managed
+process startup/stop, keyed prompt settlement, Ollama scheduling handoff and
+cached history/artifact survival after restart. The dashboard scenario verifies
+interrupted recovery and worker-safe restart. [Opt-in live lifecycle scenario](../../tests/test_live_backends.py)
+checks installed Ollama residency and managed ComfyUI model discovery, handoff and
+idle stop. Real generation, Dropbox and non-Windows process containment remain
+unverified.
 
 Related: [contracts](../INVARIANTS.md),
 [execution ownership ADR](../DECISIONS/0002-shared-execution-and-backend-ownership.md).

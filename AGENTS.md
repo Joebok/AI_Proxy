@@ -23,6 +23,15 @@ tree. [README.md](README.md) remains the subscriber integration guide.
   Prefer existing dependencies and tools; no configured lint/type-check suite.
 - Resolve material ambiguity from code/tests first; otherwise ask one concise
   question. Never silently treat an assumption as implemented behavior.
+- Keep a small suite of representative end-to-end tests for current behavior.
+  Do not add tests or expand existing scenarios into new test cases, branches,
+  parameter matrices, compatibility coverage, or coverage targets without Joe's
+  explicit approval. This also applies to tests Codex proposes after a defect.
+  Ask before authoring the test; continue implementation and existing validation
+  without it when feasible. Updating helpers, assertions, and synchronization
+  inside an approved scenario is allowed when its intent stays the same. Joe's
+  approved baseline is five isolated end-to-end scenarios and one explicitly
+  gated live backend lifecycle scenario. No unit tests are authorized beyond it.
 
 ## Commands
 
@@ -31,13 +40,15 @@ Use the project virtual environment, not system Python. From the repository root
 ```powershell
 .\.venv\Scripts\python.exe -m file_proxy.cli --help
 .\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe -m pytest tests/test_http_scheduler.py -q
+.\.venv\Scripts\python.exe -m pytest tests/test_e2e.py::test_file_jobs_wait_for_complete_inputs_and_publish_terminal_results -q
+.\.venv\Scripts\python.exe -m pytest tests/test_e2e.py::test_comfyui_settlement_handoff_and_cached_result_survive_restart -q
 git diff --check
 ```
 
 Setup and operational commands, command verification status, and the observed
 baseline test failure are in [Docs/DEVELOPMENT.md](Docs/DEVELOPMENT.md). Do not run
 `once`, `run`, or `tui` against a real queue just to validate a code change.
+The live backend scenario is opt-in; see [DEVELOPMENT.md](Docs/DEVELOPMENT.md).
 
 ## Mandatory boundaries
 

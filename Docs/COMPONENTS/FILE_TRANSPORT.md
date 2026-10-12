@@ -75,11 +75,11 @@ Payload schema and prompt changes belong in the subscriber worker; only extend
 the manifest when transport/scheduling needs it. Inventory/identity changes affect
 publishers, workers, harvesters and recovery together.
 
-[test_proxy.py](../../tests/test_proxy.py) covers FIFO/affinity, hints, partial
-sync, invalid jobs, path safety, subprocess failures/timeouts, lock behavior,
-interrupted recovery, rename sharing violations and status. HTTP scheduler tests
-cover managed invalid publication/non-preemption; TUI tests cover stop waiting
-for workers. Full journal crash-window and real sync behavior remain unverified.
+[File task scenario](../../tests/test_e2e.py) covers delayed inventory sync,
+subprocess success/failure, worker-output path validation, and published answer
+inventory. The dashboard scenario in the same module verifies interrupted
+recovery without replay and safe worker shutdown. Priority combinations,
+sync-grace expiry and journal crash windows are not separate scenarios.
 
 Related contracts: [INVARIANTS.md](../INVARIANTS.md). Related reconstructed choice:
 [transport/local-state ADR](../DECISIONS/0001-transport-and-local-state.md).

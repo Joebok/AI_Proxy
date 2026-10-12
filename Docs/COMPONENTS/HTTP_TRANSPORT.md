@@ -45,8 +45,8 @@ Timeout/transport failures after dispatch may unload/reconcile Ollama and block
 the manager if ambiguity remains. The current `_relay` cancellation branch
 attempts to drain remaining Ollama stream bytes after a downstream disconnect;
 that attempt is not a guaranteed drain because request context cancellation can
-close upstream. The disconnect test observes a cancelled outcome. Preserve this
-distinction when changing stream ownership.
+close upstream. Disconnect cancellation is not a separate end-to-end scenario.
+Preserve this distinction when changing stream ownership.
 
 ## ComfyUI prompt lifecycle
 
@@ -101,12 +101,11 @@ identity, admission ownership, and durable record behavior. New artifact formats
 need archive/cache safety and publication-order checks. Profile defaults and CLI
 configuration must stay consistent across headless/dashboard modes.
 
-[test_http_proxy.py](../../tests/test_http_proxy.py) covers streaming incrementality,
-headers/body forwarding, bypass, body limits, upstream timeout/failure, resource
-keys and disconnect diagnostics. [test_reliable_lifecycle.py](../../tests/test_reliable_lifecycle.py)
-covers UUID tracking, terminal error, keyed-history slot holding, store reopen and
-managed-output path containment. Full archival/retention/delete lifecycle and
-external unresolved cancellation/restart acceptance are not fully covered.
+[Shared scheduler scenario](../../tests/test_e2e.py) verifies streamed forwarding,
+request IDs, queued work and discovery bypass. [ComfyUI lifecycle scenario](../../tests/test_e2e.py)
+verifies keyed-history settlement and cached history/artifact retrieval after
+restart. The test suite does not separately cover every status, body limit,
+disconnect, eviction or external unresolved cancellation branch.
 
 Related: [INVARIANTS.md](../INVARIANTS.md),
 [execution ownership ADR](../DECISIONS/0002-shared-execution-and-backend-ownership.md),

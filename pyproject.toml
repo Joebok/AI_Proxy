@@ -22,3 +22,4 @@ include = ["file_proxy*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["live_backends: requires installed Ollama and managed ComfyUI runtime"]

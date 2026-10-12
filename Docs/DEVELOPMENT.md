@@ -25,36 +25,38 @@ the equivalent interpreter is `.venv/bin/python`; this platform was not exercise
 ## Checks and observed results
 
 Run from repository root. Only label commands verified when they succeeded in
-the current environment. Baseline execution on 2026-10-11, before doc edits:
+the current environment. Before the test-suite replacement, the legacy suite
+passed 69 tests and skipped one Windows symlink test. Its individual checks are
+now represented by five end-to-end scenarios. Baseline was collected on
+2026-10-11:
 
 | Command | Observed status |
 | --- | --- |
 | `.\.venv\Scripts\python.exe --version` | Passed; Python 3.14.6. |
 | `.\.venv\Scripts\python.exe -m file_proxy.cli --help` | Passed; parser exposes `run`, `tui`, `once`, `status`, `validate-subscriber`. Does not load registries or touch a queue. |
-| `.\.venv\Scripts\python.exe -m pytest -q` | **Failed:** 68 passed, 1 failed, 1 skipped in 19.32 s. Failure: `test_policy_hot_reload_retains_last_known_good`, `KeyError: 'reasoning_effort'` at the first assertion after rapid policy rewrite. |
-| `.\.venv\Scripts\python.exe -m pytest tests/test_reasoning_policy.py::test_policy_hot_reload_retains_last_known_good -q` | **Failed again:** same assertion, 0.37 s. Failure predates documentation edits. |
+| `.\.venv\Scripts\python.exe -m pytest -q` | Passed after replacement: 5 isolated end-to-end scenarios; the live backend scenario was deselected. |
 
-The skipped proxy test could not create a symlink in this Windows environment.
-The reload implementation skips a file when `st_mtime_ns` equals the last loaded
-value; timestamp-based change detection is a plausible cause of the failure,
-not a confirmed diagnosis. No application or test changes were made to fix it.
-See the [completed task record](../plans/completed/2026-10-11-agent-knowledge-base.md)
-for final documentation validation results.
-
-Select checks by affected capability using [CODE_MAP.md](CODE_MAP.md):
+The replacement policy scenario advances and verifies the policy file timestamp
+before checking reload. It does not change application reload logic. The earlier
+intermittent reload assertion did not reproduce in the pre-replacement baseline.
+Select an isolated scenario by name as needed. The opt-in live check loads and
+unloads an installed Ollama model and starts managed ComfyUI. Stop the normal
+proxy first and choose a model that fits available GPU memory:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests/test_proxy.py -q
-.\.venv\Scripts\python.exe -m pytest tests/test_http_scheduler.py tests/test_http_proxy.py -q
-.\.venv\Scripts\python.exe -m pytest tests/test_reliable_lifecycle.py tests/test_tui.py -q
-.\.venv\Scripts\python.exe -m pytest tests/test_reasoning_policy.py tests/test_diagnostics.py -q
+.\.venv\Scripts\python.exe -m pytest tests/test_e2e.py -q
+.\.venv\Scripts\python.exe -m pytest tests/test_e2e.py -k dashboard -q
+.\.venv\Scripts\python.exe -m pytest tests/test_live_backends.py -q --live-backends --live-runtime-config .\runtime-config.local.json --ollama-test-model qwen3:4b-q4_K_M
 git diff --check
 ```
 
-These targeted group commands are suggested, not separately verified commands;
-their tests were included in the full suite. Tests use temporary envelopes,
-loopback fake servers, and disposable subprocesses rather than real GPU runtimes.
-Review tests before running against an unusual environment.
+The default suite uses temporary envelopes/runtime directories, loopback fake
+services, and disposable worker/backend processes. The live check refuses to
+run if Ollama already has a resident model, if the normal proxy owns its local
+runtime lock, if the installed model/configuration is missing, or if ComfyUI
+cannot be safely started. It never runs a workflow or text generation. It may
+use GPU memory while active. Live validation was not run during this replacement
+because the normal proxy currently owns the lock.
 
 ## Operation and deployment
 
@@ -125,12 +127,13 @@ enforced truncation guarantee.
 
 ## Coverage gaps and further investigation
 
-Direct tests are absent or incomplete for manifest priority combinations, HTTP
-barriers/oldest override, local-journal publication crash windows, full artifact
-archive/eviction/output-deletion sequence, and external unresolved cancellation/
-restart recovery. Existing fake-server/process tests do not establish real GPU,
-Dropbox, Linux process-tree cleanup, or subscriber end-to-end correctness. Any
-change in these areas should add targeted contract checks as part of its plan.
+The small functional suite demonstrates representative current flows; it is not
+a branch-by-branch contract inventory. It does not directly verify every
+priority/barrier combination, journal crash window, cache eviction, external
+unresolved cancellation/restart, real inference/rendering, Dropbox sync, Linux
+process-tree cleanup, or subscriber harvest behavior. Follow the approval rule
+in [AGENTS.md](../AGENTS.md) before adding a test to address such a gap; tests
+are not the default response to every code change.
 
 ## Documentation validation workflow
 

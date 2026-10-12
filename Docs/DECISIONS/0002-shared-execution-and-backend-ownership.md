@@ -3,7 +3,7 @@
 - Status: retrospective record of current implementation, reconstructed 2026-10-11.
 - Evidence: [engine.py](../../file_proxy/engine.py), [scheduler.py](../../file_proxy/scheduler.py),
   [http_proxy.py](../../file_proxy/http_proxy.py), [backend.py](../../file_proxy/backend.py),
-  [test_reliable_lifecycle.py](../../tests/test_reliable_lifecycle.py).
+  [ComfyUI lifecycle scenario](../../tests/test_e2e.py).
 
 ## Context
 

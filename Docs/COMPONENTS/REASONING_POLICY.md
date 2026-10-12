@@ -15,8 +15,8 @@ this task did not inspect the generating repository or its deployed policy.
 
 ## Format and normalization
 
-Authoritative parser: `ReasoningPolicyStore._validate`; compact examples:
-[test_reasoning_policy.py](../../tests/test_reasoning_policy.py) `write_policy`.
+Authoritative parser: `ReasoningPolicyStore._validate`; the controlled policy
+fixture is part of the [policy-through-HTTP scenario](../../tests/test_e2e.py).
 Root: `schema_version: 1`, `aliases` object, optional `generated_at`.
 Each alias policy requires:
 
@@ -49,9 +49,9 @@ successful load normalization remains inactive. It does not persist policy copie
 Status reports source path, loaded/generated time, alias count, last reload error
 and whether any last-known-good load exists.
 
-Known observation: `test_policy_hot_reload_retains_last_known_good` failed twice
-on rapid rewrite during this task; timestamp-only detection is a suspected cause,
-not a confirmed diagnosis. Do not mark hot reload reliably verified on this host.
+The end-to-end policy scenario advances and verifies `st_mtime_ns` before
+checking reload so rapid same-tick rewrites do not obscure the intended behavior.
+The earlier intermittent assertion failure did not reproduce in the baseline.
 Also, `datetime.UTC` import leaves the packaging Python 3.10 minimum unverified.
 See [DEVELOPMENT.md](../DEVELOPMENT.md).
 
@@ -60,9 +60,9 @@ format validation, native/unknown preservation checks and external producer
 compatibility analysis. Expanding supported routes changes transport behavior and
 requires a plan; it must not introduce task-specific prompt interpretation.
 
-Tests cover explicit/default mapping, unsupported removal, unknown/native route
-preservation and intended last-known-good reload. Missing-file recovery and
-header/admission effects of normalization are not independently established by
-dedicated integration tests. Related boundary:
+[Policy-through-HTTP scenario](../../tests/test_e2e.py) covers default mapping,
+message preservation, native route pass-through, hot reload and malformed
+last-known-good retention. Unsupported-alias edge cases and policy-related
+header/admission effects are not separate scenarios. Related boundary:
 [transport ADR](../DECISIONS/0001-transport-and-local-state.md) and
 [INVARIANTS.md](../INVARIANTS.md).

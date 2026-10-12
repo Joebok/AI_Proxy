@@ -85,18 +85,18 @@ clock skew affects arbitration. Age override exists for HTTP, not file jobs.
 
 Changes to priority/affinity/backend normalization affect worker hints, Forge
 cleanup, backend process residency, HTTP/control ordering and client latency.
-Update the two selection layers and cross-queue tests together as required.
+Update the two selection layers together and run the shared scheduler scenario.
+Ask Joe before expanding that scenario or adding another test for uncovered
+priority combinations.
 Do not dispatch futures or release slots from a new path without explicit ownership.
 
 ## Tests and decisions
 
-[test_http_scheduler.py](../../tests/test_http_scheduler.py): no-key FIFO, affinity
-not overtaking backend blocks, older different-backend file before HTTP, preference/
-continuation grace, cancellation, invalid managed jobs and non-preemption.
-[test_proxy.py](../../tests/test_proxy.py): bounded file affinity, backend blocks,
-FIFO and next-resource hints. [test_reliable_lifecycle.py](../../tests/test_reliable_lifecycle.py)
-checks prompt slot lifetime; TUI tests check active worker shutdown. Direct tests
-for HTTP barrier/age override and priority combinations remain gaps.
+[Shared scheduler scenario](../../tests/test_e2e.py) verifies non-preemptive file
+and HTTP work, streamed completion, queued follow-up requests and a responsive
+bypass route. [ComfyUI lifecycle scenario](../../tests/test_e2e.py) verifies the
+slot remains held through keyed history. Priority matrices, HTTP barriers and age
+override do not have separate scenarios.
 
 Related: [contracts](../INVARIANTS.md),
 [shared execution ADR](../DECISIONS/0002-shared-execution-and-backend-ownership.md).
