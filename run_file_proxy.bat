@@ -12,7 +12,7 @@ if not exist "%ZET_PROJECT_ROOT%\config.toml" (
   echo ZET_PROJECT_ROOT does not contain config.toml: %ZET_PROJECT_ROOT%
   exit /b 2
 )
-if not defined AI_QUEUE_ROOT set "AI_QUEUE_ROOT=%USERPROFILE%\Dropbox\AI_Queue"
+if not defined AI_QUEUE_ROOT set "AI_QUEUE_ROOT=E:\Zet\AI_Queue"
 if not defined FILE_PROXY_SYNC_GRACE_SECONDS set "FILE_PROXY_SYNC_GRACE_SECONDS=300"
 if not defined AI_PROXY_HTTP_HOST set "AI_PROXY_HTTP_HOST=127.0.0.1"
 if not defined AI_PROXY_HTTP_PORT set "AI_PROXY_HTTP_PORT=11433"

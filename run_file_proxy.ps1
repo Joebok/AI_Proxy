@@ -12,7 +12,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $env:ZET_PROJECT_ROOT "config.toml")
     throw "ZET_PROJECT_ROOT does not contain config.toml: $env:ZET_PROJECT_ROOT"
 }
 if (-not $env:AI_QUEUE_ROOT) {
-    $env:AI_QUEUE_ROOT = Join-Path $env:USERPROFILE "Dropbox\AI_Queue"
+    $env:AI_QUEUE_ROOT = "E:\Zet\AI_Queue"
 }
 if (-not $env:FILE_PROXY_SYNC_GRACE_SECONDS) {
     $env:FILE_PROXY_SYNC_GRACE_SECONDS = "300"
