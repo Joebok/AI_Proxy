@@ -30,3 +30,12 @@ contains examples; [zet.json](../registries/zet.json) registers
 separate Zet checkout.
 Inspect the relevant subscriber repository before planning changes to its task
 behavior. Do not assume README example code is imported here.
+
+## Native AI boundary (2026-10-16)
+- `ai_worker.py` owns generic Codex/Ollama/ComfyUI invocation and result manifests.
+- `Proxy.cloud_dispatch` owns trusted cloud admission; local scheduler and resource
+  affinity exclude Codex. Runtime configuration owns cloud capacity and Codex names.
+- `model_catalog.py` owns shared capability metadata, with HTTP metadata access in
+  `_special_route` and file refresh requests hosted by the independent dispatcher.
+- `test_cloud_jobs_run_alongside_local_work_and_recover_without_replay` is the
+  approved sixth isolated scenario. See [native providers](COMPONENTS/AI_PROVIDERS.md).

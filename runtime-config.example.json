@@ -28,5 +28,13 @@
   "diagnostic_log_retention_days": 3,
   "cache_max_bytes": 10737418240,
   "max_resource_streak": 5,
-  "oldest_request_seconds": 60
+  "oldest_request_seconds": 60,
+  "cloud_concurrency": 2,
+  "codex_models": [
+    "gpt-6-luna",
+    "gpt-6-sol",
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra"
+  ]
 }

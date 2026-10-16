@@ -407,6 +407,7 @@ class HttpProxyService:
         self.store = store
         self.backend_manager = backend_manager
         self.status_provider = status_provider
+        self.model_catalog = None
         self.reasoning_policies = reasoning_policies
         self.diagnostic_log = diagnostic_log
         self.retention_days = retention_days
@@ -711,6 +712,9 @@ class HttpProxyService:
         return b"".join(chunks)
 
     async def _special_route(self, request: web.Request) -> web.StreamResponse | None:
+        if request.path == "/_proxy/models" and self.model_catalog and request.method in {"GET", "POST"}:
+            catalog = await asyncio.to_thread(self.model_catalog.refresh) if request.method == "POST" else self.model_catalog.read()
+            return web.json_response(catalog)
         if request.method == "GET" and request.path == "/_proxy/status":
             data: dict[str, object] = {"backend": self.profile.name, "queue": self.queue.snapshot()}
             if self.backend_manager:
@@ -1273,6 +1277,9 @@ async def run_http_proxies(
         (config.upstream for config in configs if config.profile.name == "ollama"),
         "http://127.0.0.1:11434",
     )
+    proxy.ollama_upstream = ollama_upstream
+    proxy.comfyui_upstream = runtime.managed_comfyui.upstream if runtime else next(
+        (config.upstream for config in configs if config.profile.name == "comfyui"), "http://127.0.0.1:8188")
     manager = (
         BackendManager(runtime.managed_comfyui, Path(runtime.runtime_dir), logger, ollama_upstream)
         if runtime
@@ -1303,6 +1310,10 @@ async def run_http_proxies(
         )
         for config in configs
     ]
+    from .model_catalog import ModelCatalog
+    catalog = ModelCatalog(proxy.control_root / "model_catalog.json", proxy.ollama_upstream, proxy.comfyui_upstream, proxy.codex_models)
+    for service in services:
+        service.model_catalog = catalog
     if runtime_state is not None:
         runtime_state.queue = queue
         runtime_state.services = services

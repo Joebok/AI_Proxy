@@ -51,7 +51,7 @@ registry directory. Each file has a subscriber ID (defaults to filename stem)
 and nonempty `workers` mapping. Duplicate subscribers and invalid worker names
 fail startup. [WorkerRegistration](../file_proxy/models.py) defines command
 argument array, positive timeout (`timeout_seconds`, with `timeout` fallback),
-optional working directory, and optional `backend` (`ollama`/`comfyui`).
+optional working directory, and optional `backend` (`ollama`/`comfyui`/`codex`).
 
 `${NAME}` substitution uses the proxy process environment in string/list values;
 missing variables fail loading. Configured cwd must already exist. Relative cwd
@@ -130,3 +130,12 @@ Retention deletes terminal records and associated files oldest-first for age or
 capacity; pending records remain. Cache byte accounting uses metadata sizes, not
 a filesystem scan. Full transactional filesystem/database recovery and orphan
 cleanup are not established; do not promise them.
+
+## Native provider extension (2026-10-16)
+`ai_request.json` and `ai_result.json` are version-1 payloads in the existing envelope;
+job protocol version is unchanged. Trusted `backend=codex` selects the cloud lane.
+`cloud_concurrency` is a positive integer, default two; `codex_models` is a configured
+list of bare Codex model names. `Control/model_catalog.json` is an atomic shared
+metadata snapshot; `Control/refresh-models.json` coalesces metadata refresh requests.
+Local `unsettled_comfyui.json` fences ambiguous GPU execution across restart. See
+[native providers](COMPONENTS/AI_PROVIDERS.md) for interface ownership.

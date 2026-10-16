@@ -42,3 +42,11 @@ Changes to any contract need an explicit impact analysis covering the listed
 consumers and validation gaps; record compatibility changes in data/component
 docs and a durable decision when appropriate. Do not silently strengthen these
 claims into guarantees the implementation does not provide.
+
+## Native cloud/local boundary (2026-10-16)
+Trusted worker registration, never payload content, determines cloud admission.
+Codex work must not prepare/release local backends or update local affinity. Local
+operations retain one non-preemptive slot; cloud capacity defaults to two. Recovery
+runs before admission and never replays interrupted attempts. Unresolved native
+ComfyUI submissions durably block local execution, not cloud execution. Native
+provider code imports no subscriber application and does not rewrite task prompts.

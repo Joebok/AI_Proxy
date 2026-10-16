@@ -128,8 +128,8 @@ class WorkerRegistration:
         ):
             raise ValueError("worker working_directory must be a non-empty string")
         backend = data.get("backend")
-        if backend is not None and backend not in {"ollama", "comfyui"}:
-            raise ValueError("worker backend must be 'ollama' or 'comfyui'")
+        if backend is not None and backend not in {"ollama", "comfyui", "codex"}:
+            raise ValueError("worker backend must be 'ollama', 'comfyui' or 'codex'")
         return cls(tuple(command), float(timeout), working_directory, backend)
 
 

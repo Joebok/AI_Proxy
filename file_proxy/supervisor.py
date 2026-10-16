@@ -63,6 +63,9 @@ class RuntimeSupervisor:
         self.proxy = proxy
         self.configs = tuple(configs)
         self.runtime_config = runtime_config
+        self.proxy.cloud_concurrency = runtime_config.cloud_concurrency
+        self.proxy.codex_models = runtime_config.codex_models
+        self.proxy.comfyui_upstream = runtime_config.managed_comfyui.upstream
         self.poll_seconds = poll_seconds
         self.state = "stopped"
         self.error: str | None = None
@@ -199,17 +202,18 @@ class RuntimeSupervisor:
             recovered = self.proxy.recover_interrupted()
             if recovered:
                 self.proxy.logger(f"Recovered {recovered} interrupted job(s)")
-            loop.call_soon_threadsafe(ready_event.set)
-            self.proxy.logger(f"Ready; polling every {self.poll_seconds:g}s.")
-            idle = False
-            while not self._file_stop.is_set():
-                if self.proxy.process_once() is None:
-                    if not idle:
-                        self.proxy.logger("Queue is idle")
-                        idle = True
-                    self._file_stop.wait(self.poll_seconds)
-                else:
-                    idle = False
+            with self.proxy.cloud_dispatch(self.poll_seconds):
+                loop.call_soon_threadsafe(ready_event.set)
+                self.proxy.logger(f"Ready; polling every {self.poll_seconds:g}s.")
+                idle = False
+                while not self._file_stop.is_set():
+                    if self.proxy.process_once() is None:
+                        if not idle:
+                            self.proxy.logger("Queue is idle")
+                            idle = True
+                        self._file_stop.wait(self.poll_seconds)
+                    else:
+                        idle = False
 
     def _runtime_done(self, task: asyncio.Task[None]) -> None:
         if self.state in {"stopping", "stopped"} or task.cancelled():

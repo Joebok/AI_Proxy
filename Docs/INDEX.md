@@ -55,3 +55,8 @@ cross-repository claims were not verified in subscriber/ModelUpdater checkouts.
 Each concept has one detail owner above. Add focused docs only for knowledge
 that requires investigation or crosses component boundaries; add their retrieval
 entry here. Keep code references relative and symbol-based, avoiding line numbers.
+
+## Native AI integration (2026-10-16)
+[Native AI providers](COMPONENTS/AI_PROVIDERS.md) owns the versioned request/result
+payload, independent Codex lane, catalog/cache interface and legacy registration
+policy. [ADR 0004](DECISIONS/0004-native-ai-and-cloud-lane.md) records the boundary.

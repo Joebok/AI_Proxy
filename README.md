@@ -840,3 +840,13 @@ Before declaring another application integrated, verify:
 ## License
 
 Copyright (c) 2026 Joe Schonbok. Licensed under the [MIT License](LICENSE).
+
+## Uniform native AI jobs
+
+New subscribers can package an inventoried `ai_request.json` and register
+`python3 -m file_proxy.ai_worker --provider codex|ollama|comfyui`. The included Zet
+registry uses `ai_codex`, `ai_ollama`, `ai_comfyui`; old worker IDs remain only for
+legacy envelopes. `backend: "codex"` selects an independent execution lane that can
+run while local generation occupies its shared slot. Configure `cloud_concurrency`
+(default 2) and `codex_models` in runtime JSON. Application prompts, prepared render
+graphs and harvesting remain subscriber-owned. See [native provider integration](Docs/COMPONENTS/AI_PROVIDERS.md).

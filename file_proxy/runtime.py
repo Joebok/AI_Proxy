@@ -38,6 +38,8 @@ class RuntimeConfig:
     diagnostic_log_retention_days: int = 3
     cache_max_bytes: int = 10 * 1024 * 1024 * 1024
     max_resource_streak: int = 5
+    cloud_concurrency: int = 2
+    codex_models: tuple[str, ...] = ("gpt-6-luna", "gpt-6-sol", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra")
     oldest_request_seconds: float = 60.0
 
     @classmethod
@@ -66,6 +68,10 @@ class RuntimeConfig:
             if not isinstance(args, list) or any(not isinstance(value, str) for value in args):
                 raise ValueError("managed_comfyui.arguments must be a string array")
             managed["arguments"] = tuple(args)
+        if "codex_models" in data:
+            if not isinstance(data["codex_models"], list):
+                raise ValueError("codex_models must be a list of model names")
+            data["codex_models"] = tuple(data["codex_models"])
         result = cls(managed_comfyui=ManagedComfyUIConfig(**managed), **data)
         result.validate(path.parent)
         return result
@@ -92,6 +98,10 @@ class RuntimeConfig:
         )
 
     def validate(self, base: Path | None = None) -> None:
+        if isinstance(self.cloud_concurrency, bool) or not isinstance(self.cloud_concurrency, int):
+            raise ValueError("cloud_concurrency must be a positive integer")
+        if not self.codex_models or any(not isinstance(model, str) or not model.strip() for model in self.codex_models):
+            raise ValueError("codex_models must contain model names")
         positive = {
             "generation_settlement_seconds": self.generation_settlement_seconds,
             "cancellation_grace_seconds": self.cancellation_grace_seconds,
@@ -102,6 +112,7 @@ class RuntimeConfig:
             "diagnostic_log_retention_days": self.diagnostic_log_retention_days,
             "cache_max_bytes": self.cache_max_bytes,
             "max_resource_streak": self.max_resource_streak,
+            "cloud_concurrency": self.cloud_concurrency,
         }
         if any(isinstance(value, bool) or value <= 0 for value in positive.values()):
             raise ValueError("runtime limits must be positive")

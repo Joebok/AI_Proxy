@@ -83,3 +83,9 @@ sync-grace expiry and journal crash windows are not separate scenarios.
 
 Related contracts: [INVARIANTS.md](../INVARIANTS.md). Related reconstructed choice:
 [transport/local-state ADR](../DECISIONS/0001-transport-and-local-state.md).
+
+## Native provider payloads (2026-10-16)
+Native `ai_*` registrations execute `ai_request.json` version 1 while preserving the
+protocol-v1 envelope/inventory. Result interpretation/application remains with the
+subscriber. Legacy registrations remain for existing immutable asks. See
+[native providers](AI_PROVIDERS.md) for contracts, cloud scheduling and model metadata.

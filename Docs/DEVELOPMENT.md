@@ -144,3 +144,16 @@ and inspect the scoped documentation diff; remember untracked documents are not
 included in ordinary `git diff`. Compare final source/test/config state with the
 starting checkout so pre-existing work is preserved. Record failures and commands
 not exercised instead of marking all instructions verified.
+
+
+## Unified AI jobs validation (2026-10-16)
+
+`.\.venv\Scripts\python.exe -m pytest -q`: **6 passed, 1 live scenario deselected (9.45s)**. The explicitly approved new isolated scenario
+is included. Python AST and changed browser-script syntax checks, introduced Markdown
+links, and `git diff --check` passed. Disposable prepared-response checks covered
+restart continuation, duplicate application, incomplete transfer, retained harvest
+failure/retry, ownership fencing, offline/malformed model catalogs and recoverable
+history. A transient Windows state-read sharing violation was found and repaired
+before the final Zet baseline passed. No dependencies or live backend calls were
+added. Upgrade AI_Proxy registrations before migrated Zet; no production rollout
+was performed. See the [completed plan](../plans/completed/2026-10-16-unified-ai-jobs.md).

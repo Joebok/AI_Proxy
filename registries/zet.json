@@ -18,10 +18,43 @@
         "-m",
         "AI_Manager.local_image_proxy_worker",
         "--config",
-        "${ZET_PROJECT_ROOT}\\config.toml"
+        "${ZET_PROJECT_ROOT}/config.toml"
       ],
       "working_directory": "${ZET_PROJECT_ROOT}",
       "timeout_seconds": 7500
+    },
+    "ai_ollama": {
+      "backend": "ollama",
+      "command": [
+        "python3",
+        "-m",
+        "file_proxy.ai_worker",
+        "--provider",
+        "ollama"
+      ],
+      "timeout_seconds": 7600
+    },
+    "ai_comfyui": {
+      "backend": "comfyui",
+      "command": [
+        "python3",
+        "-m",
+        "file_proxy.ai_worker",
+        "--provider",
+        "comfyui"
+      ],
+      "timeout_seconds": 7600
+    },
+    "ai_codex": {
+      "backend": "codex",
+      "command": [
+        "python3",
+        "-m",
+        "file_proxy.ai_worker",
+        "--provider",
+        "codex"
+      ],
+      "timeout_seconds": 7600
     }
   }
 }

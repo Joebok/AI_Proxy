@@ -3,7 +3,7 @@
 AI_Proxy combines eventually synchronized filesystem jobs and local HTTP
 requests into serialized expensive work. A **subscriber** is an application
 namespace with locally registered one-job workers. A **backend** is an execution
-family (`ollama` or `comfyui`); a **resource key** identifies a model/workflow for
+family (`ollama`, `comfyui` or `codex`); a **resource key** identifies a model/workflow for
 affinity. An **execution slot** is the scheduler's right to dispatch expensive
 work, not a GPU driver lock. See [scheduling](COMPONENTS/SCHEDULING.md) for ordering.
 
@@ -98,3 +98,5 @@ external side effects: single-attempt execution is not exactly-once delivery.
 - Retrospective choices are recorded in [DECISIONS](DECISIONS/0001-transport-and-local-state.md).
   Live Dropbox timing, real GPU applications, subscriber behavior, and Python
   3.10 compatibility were not verified; see development for known gaps.
+
+Native generic AI execution and independent Codex admission are described in [native providers](COMPONENTS/AI_PROVIDERS.md). Only local Ollama/ComfyUI work shares the serialized resource slot; cloud work is independently bounded.

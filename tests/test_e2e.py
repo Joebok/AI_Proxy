@@ -91,6 +91,65 @@ def test_file_jobs_wait_for_complete_inputs_and_publish_terminal_results(tmp_pat
     asyncio.run(scenario())
 
 
+def test_cloud_jobs_run_alongside_local_work_and_recover_without_replay(tmp_path: Path) -> None:
+    """Joe-approved cloud/local concurrency and lifecycle scenario."""
+    from file_proxy.models import WorkerRegistration
+    from file_proxy.scheduler import HttpQueue
+    from file_proxy.ai_worker import execute
+    provider_job = tmp_path / "provider-job"
+    provider_job.mkdir()
+    fake_codex = tmp_path / "codex.py"
+    fake_codex.write_text(
+        "import pathlib,sys,json\n"
+        "a=sys.argv; assert a[a.index('-s')+1]=='read-only'; assert '--output-schema' in a\n"
+        "assert '--image' in a; assert 'frozen prompt' in sys.stdin.read()\n"
+        "pathlib.Path(a[a.index('--output-last-message')+1]).write_text(json.dumps({'summary':'prepared'}))\n",
+        encoding="utf-8")
+    (provider_job / "image.png").write_bytes(b"prepared image")
+    (provider_job / "ask_manifest.json").write_text(json.dumps({"ask_id": "provider", "expected_output": "answer.json"}))
+    (provider_job / "ai_request.json").write_text(json.dumps({"version": 1, "provider": "codex", "model": "codex:controlled",
+        "prompt": "frozen prompt", "schema": {"type": "object", "required": ["summary"], "properties": {"summary": {"type": "string"}}},
+        "images": ["image.png"], "output": "answer.json"}))
+    assert execute(provider_job, "codex", codex=[sys.executable, str(fake_codex)])
+    assert json.loads((provider_job / "answer.json").read_text())["summary"] == "prepared"
+    async def scenario():
+        counter, local_gate, cloud_gate = tmp_path / "runs", tmp_path / "local-gate", tmp_path / "cloud-gate"
+        worker = write_worker(tmp_path, counter=counter)
+        registry = write_registry(tmp_path / "registry", worker, counter=counter, gate=local_gate)
+        registry.subscribers["demo"]["cloud"] = WorkerRegistration(
+            (sys.executable, str(worker), "--counter", str(counter), "--gate", str(cloud_gate)), 10, backend="codex")
+        proxy = Proxy(tmp_path / "queue", registry, local_runtime_dir=tmp_path / "runtime")
+        proxy.ensure_layout()
+        seed_running(proxy.root, "interrupted", worker="cloud")
+        assert proxy.recover_interrupted() == 1
+        assert json.loads((proxy.answer_root / "demo/interrupted/proxy_result.json").read_text())["error_type"] == "PROXY_INTERRUPTED"
+        publish_job(proxy.root, "local")
+        scheduler = asyncio.create_task(proxy.run_scheduler(HttpQueue(), 0.01, 0))
+        try:
+            await wait_for(lambda: (proxy.running_root / "demo/local").is_dir())
+            for name in ("cloud-1", "cloud-2", "cloud-3"):
+                publish_job(proxy.root, name, worker="cloud")
+            await wait_for(lambda: sum((proxy.running_root / ("demo/" + name)).is_dir() for name in ("cloud-1", "cloud-2")) == 2)
+            assert (proxy.ask_root / "demo/cloud-3").is_dir()
+            assert (proxy.running_root / "demo/local").is_dir()
+            cloud_gate.write_text("release")
+            await wait_for(lambda: (proxy.answer_root / "demo/cloud-3/proxy_result.json").is_file())
+            assert (proxy.running_root / "demo/local").is_dir()
+            local_gate.write_text("release")
+            await wait_for(lambda: (proxy.answer_root / "demo/local/proxy_result.json").is_file())
+        finally:
+            local_gate.write_text("release")
+            cloud_gate.write_text("release")
+            scheduler.cancel()
+            try:
+                await scheduler
+            except asyncio.CancelledError:
+                pass
+        assert sorted(counter.read_text().splitlines()) == ["cloud-1", "cloud-2", "cloud-3", "local"]
+        assert proxy.recover_interrupted() == 0
+    asyncio.run(scenario())
+
+
 def test_dashboard_waits_for_workers_and_recovers_without_replay(tmp_path: Path) -> None:
     async def scenario() -> None:
         runtime_dir = tmp_path / "runtime"

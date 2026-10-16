@@ -7,6 +7,9 @@ from pathlib import Path
 import socket
 import subprocess
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from typing import Any
 from collections.abc import Callable
 import urllib.error
@@ -126,6 +129,8 @@ class Proxy:
         forge_unload_timeout_seconds: float = 30.0,
         local_runtime_dir: Path | None = None,
         forge_cleanup_required: bool = False,
+        cloud_concurrency: int = 2,
+        codex_models=None,
     ):
         if max_resource_streak <= 0:
             raise ValueError("max_resource_streak must be positive")
@@ -142,6 +147,14 @@ class Proxy:
             else requested_root / "File_Proxy"
         )
         self.registry = registry
+        if isinstance(cloud_concurrency, bool) or not isinstance(cloud_concurrency, int) or cloud_concurrency < 1:
+            raise ValueError("cloud_concurrency must be a positive integer")
+        self.cloud_concurrency = cloud_concurrency
+        self.codex_models = codex_models
+        self._active_jobs: set[tuple[str, str]] = set()
+        self._scan_guard = threading.RLock()
+        self.ollama_upstream = "http://127.0.0.1:11434"
+        self.comfyui_upstream = "http://127.0.0.1:8188"
         self.logger = logger or (lambda _message: None)
         self.sync_grace_seconds = sync_grace_seconds
         self.max_resource_streak = max_resource_streak
@@ -212,6 +225,7 @@ class Proxy:
         recovered = 0
         for subscriber_dir in sorted(path for path in self.running_root.iterdir() if path.is_dir()):
             for job_dir in sorted(path for path in subscriber_dir.iterdir() if path.is_dir()):
+                self._preserve_unsettled_backend(job_dir)
                 local_outcome = self._local_outcome_path(subscriber_dir.name, job_dir.name)
                 if local_outcome.is_file() and not (job_dir / "proxy_result.json").is_file():
                     _write_json_atomic(job_dir / "proxy_result.json", json.loads(local_outcome.read_text(encoding="utf-8")))
@@ -294,10 +308,13 @@ class Proxy:
 
     def _select_file_job(
         self,
+        *, include_cloud: bool = False,
     ) -> QueueJob | tuple[Path, str, str, str] | None:
         while self._publish_completed_running():
             pass
         jobs, invalid = self._scan()
+        if not include_cloud:
+            jobs = [job for job in jobs if self._file_job_backend(job) != "codex"]
         if invalid:
             return invalid[0]
         if not jobs:
@@ -309,6 +326,8 @@ class Proxy:
             return False
         for subscriber_dir in sorted(path for path in self.running_root.iterdir() if path.is_dir()):
             for job_dir in sorted(path for path in subscriber_dir.iterdir() if path.is_dir()):
+                if (subscriber_dir.name, job_dir.name) in self._active_jobs:
+                    continue
                 local_outcome = self._local_outcome_path(subscriber_dir.name, job_dir.name)
                 if local_outcome.is_file() and not (job_dir / "proxy_result.json").is_file():
                     _write_json_atomic(job_dir / "proxy_result.json", json.loads(local_outcome.read_text(encoding="utf-8")))
@@ -388,6 +407,7 @@ class Proxy:
 
     def _next_resource_hint(self) -> tuple[bool, str]:
         jobs, invalid = self._scan()
+        jobs = [job for job in jobs if self._file_job_backend(job) != "codex"]
         if invalid:
             return True, ""
         if not jobs:
@@ -399,6 +419,18 @@ class Proxy:
         self,
         selected: QueueJob | tuple[Path, str, str, str],
     ) -> Path:
+        if isinstance(selected, tuple):
+            return self._invalid(*selected)
+        identity = (selected.manifest.subscriber_id, selected.manifest.job_id)
+        with self._scan_guard:
+            self._active_jobs.add(identity)
+        try:
+            return self._execute_file_job(selected)
+        finally:
+            with self._scan_guard:
+                self._active_jobs.discard(identity)
+
+    def _execute_file_job(self, selected: QueueJob) -> Path:
         if isinstance(selected, tuple):
             return self._invalid(*selected)
         queued = selected
@@ -414,12 +446,15 @@ class Proxy:
         running.parent.mkdir(parents=True, exist_ok=True)
         _replace_with_retry(queued.path, running)
         transition_error: str | None = None
-        try:
-            self._prepare_resource(manifest.resource_key)
-        except RuntimeError as exc:
-            transition_error = str(exc)
-        self._record_resource_job(manifest)
-        next_job_present, next_resource_key = self._next_resource_hint()
+        cloud = registration.backend == "codex"
+        next_job_present, next_resource_key = False, ""
+        if not cloud:
+            try:
+                self._prepare_resource(manifest.resource_key)
+            except RuntimeError as exc:
+                transition_error = str(exc)
+            self._record_resource_job(manifest)
+            next_job_present, next_resource_key = self._next_resource_hint()
         started = utc_now()
         status = "FAILED" if transition_error else "SUCCEEDED"
         exit_code: int | None = None
@@ -442,6 +477,8 @@ class Proxy:
                 cwd=registration.working_directory,
                 env={
                     **os.environ,
+                    "AI_PROXY_OLLAMA_UPSTREAM": self.ollama_upstream,
+                    "AI_PROXY_COMFYUI_UPSTREAM": self.comfyui_upstream,
                     "AI_PROXY_CURRENT_RESOURCE_KEY": manifest.resource_key or "",
                     "AI_PROXY_NEXT_JOB_PRESENT": "1" if next_job_present else "0",
                     "AI_PROXY_NEXT_RESOURCE_KEY": next_resource_key,
@@ -490,6 +527,7 @@ class Proxy:
                 error_type = "INVALID_OUTPUT_STATE"
                 error_message = str(exc)
         completed_at = utc_now()
+        self._preserve_unsettled_backend(running)
         output_files = _inventory_with_retry(running)
         result = ProxyResult(
             protocol_version=1,
@@ -517,10 +555,95 @@ class Proxy:
         return answer
 
     def process_once(self) -> Path | None:
+        if (self.local_runtime_dir / "unsettled_comfyui.json").exists():
+            return None
         selected = self._select_file_job()
         if selected is None:
             return None
         return self._process_file_job(selected)
+
+    def _preserve_unsettled_backend(self, folder: Path) -> None:
+        path = folder / "comfyui_submission.json"
+        if path.is_file():
+            try:
+                submission = json.loads(path.read_text(encoding="utf-8"))
+                if submission.get("settled") is not True:
+                    _write_json_atomic(self.local_runtime_dir / "unsettled_comfyui.json", {
+                        "job_id": folder.name, "prompt_id": submission.get("prompt_id"),
+                        "reason": "ComfyUI submission is unresolved. Reconcile/stop the backend before clearing this local guard."})
+            except (OSError, ValueError) as exc:
+                self.logger(f"Unable to reconcile saved ComfyUI submission: {exc}")
+
+    @contextmanager
+    def cloud_dispatch(self, poll_seconds: float = 1.0):
+        """Independent trusted Codex lane; stopping waits for admitted workers."""
+        stop = threading.Event()
+        def dispatch():
+            with ThreadPoolExecutor(max_workers=self.cloud_concurrency, thread_name_prefix="proxy-cloud") as pool:
+                pending = {}
+                last_blocked = None
+                while not stop.is_set():
+                    blocked = (self.local_runtime_dir / "unsettled_comfyui.json").exists()
+                    if blocked != last_blocked:
+                        try:
+                            _write_json_atomic(self.control_root / "execution_status.json", {
+                                "local_execution_blocked": blocked,
+                                "reason": "ComfyUI submission is unresolved; reconcile the proxy's saved prompt before local execution resumes." if blocked else "",
+                                "cloud_concurrency": self.cloud_concurrency})
+                            last_blocked = blocked
+                        except OSError as exc:
+                            self.logger(f"Unable to publish execution status: {exc}")
+                    for identity, future in list(pending.items()):
+                        if future.done():
+                            try:
+                                future.result()
+                            except Exception as exc:
+                                self.logger(f"Cloud worker {identity}: {exc}")
+                            del pending[identity]
+                    try:
+                        jobs, _ = self._scan()
+                        for job in jobs:
+                            identity = (job.manifest.subscriber_id, job.manifest.job_id)
+                            if len(pending) >= self.cloud_concurrency:
+                                break
+                            if self._file_job_backend(job) != "codex" or identity in pending:
+                                continue
+                            pending[identity] = pool.submit(self._process_file_job, job)
+                    except OSError as exc:
+                        self.logger(f"Cloud queue unavailable: {exc}")
+                    stop.wait(max(0.01, poll_seconds))
+                for future in pending.values():
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        self.logger(f"Cloud shutdown: {exc}")
+        thread = threading.Thread(target=dispatch, name="proxy-cloud-dispatch", daemon=True)
+        thread.start()
+        def refresh_catalog():
+            from .model_catalog import ModelCatalog
+            catalog = ModelCatalog(self.control_root / "model_catalog.json", self.ollama_upstream, self.comfyui_upstream, self.codex_models)
+            while not stop.is_set():
+                try:
+                    catalog.refresh()
+                except OSError as exc:
+                    self.logger(f"Model catalog unavailable: {exc}")
+                for _ in range(300):
+                    if stop.wait(1):
+                        return
+                    request = self.control_root / "refresh-models.json"
+                    if request.is_file():
+                        request.unlink(missing_ok=True)
+                        break
+        native = any("file_proxy.ai_worker" in registration.command
+                     for workers in self.registry.subscribers.values() for registration in workers.values())
+        catalog_thread = threading.Thread(target=refresh_catalog, name="proxy-model-catalog", daemon=True) if native else None
+        if catalog_thread:
+            catalog_thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join()
 
     async def run_scheduler(
         self,
@@ -530,10 +653,25 @@ class Proxy:
         backend_manager: BackendManager | None = None,
         ollama_upstream: str | None = None,
     ) -> None:
+        cloud = self.cloud_dispatch(poll_seconds)
+        cloud.__enter__()
+        try:
+            await self._run_local_scheduler(http_queue, poll_seconds, continuation_grace_seconds,
+                                            backend_manager, ollama_upstream)
+        finally:
+            await asyncio.to_thread(cloud.__exit__, None, None, None)
+
+    async def _run_local_scheduler(
+        self, http_queue: HttpQueue, poll_seconds: float, continuation_grace_seconds: float,
+        backend_manager: BackendManager | None, ollama_upstream: str | None,
+    ) -> None:
         last_http_completed: float | None = None
         deferred_selected: QueueJob | tuple[Path, str, str, str] | None = None
         loop = asyncio.get_running_loop()
         while True:
+            if (self.local_runtime_dir / "unsettled_comfyui.json").exists():
+                await asyncio.sleep(max(0.01, poll_seconds))
+                continue
             selected = deferred_selected
             deferred_selected = None
             http_candidate = http_queue.peek()
@@ -634,22 +772,24 @@ class Proxy:
             recovered = self.recover_interrupted()
             if recovered:
                 self.logger(f"Recovered {recovered} interrupted job(s)")
-            self.logger(f"Ready; polling every {poll_seconds:g}s. Press Ctrl-C to stop.")
-            idle = False
-            while True:
-                if self.process_once() is None:
-                    if not idle:
-                        self.logger("Queue is idle")
-                        idle = True
-                    time.sleep(poll_seconds)
-                else:
-                    idle = False
+            with self.cloud_dispatch(poll_seconds):
+                self.logger(f"Ready; polling every {poll_seconds:g}s. Press Ctrl-C to stop.")
+                idle = False
+                while True:
+                    if self.process_once() is None:
+                        if not idle:
+                            self.logger("Queue is idle")
+                            idle = True
+                        time.sleep(poll_seconds)
+                    else:
+                        idle = False
 
     def once(self) -> Path | None:
         self.ensure_layout()
         with self.lock():
             self.recover_interrupted()
-            return self.process_once()
+            selected = self._select_file_job(include_cloud=True)
+            return self._process_file_job(selected) if selected is not None else None
 
     def status(self, subscriber: str | None = None, job: str | None = None) -> dict[str, Any]:
         try:
@@ -700,4 +840,6 @@ class Proxy:
                             item_state = "failed"
                     counts[item_state] += 1
                     items.append(item)
-        return {"counts": counts, "jobs": items, "degraded": self._filesystem_degraded}
+        blocked = (self.local_runtime_dir / "unsettled_comfyui.json").exists()
+        return {"counts": counts, "jobs": items, "degraded": self._filesystem_degraded,
+                "local_execution_blocked": blocked, "cloud_concurrency": self.cloud_concurrency}

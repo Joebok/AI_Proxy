@@ -144,11 +144,15 @@ def main(argv: list[str] | None = None) -> int:
             logger=logger,
             sync_grace_seconds=getattr(args, "sync_grace_seconds", 300.0),
             max_resource_streak=runtime.max_resource_streak,
+            cloud_concurrency=runtime.cloud_concurrency,
+            codex_models=runtime.codex_models,
             forge_upstream=getattr(args, "forge_upstream", None),
             forge_unload_timeout_seconds=getattr(args, "forge_unload_timeout_seconds", 30.0),
             local_runtime_dir=Path(runtime.runtime_dir),
             forge_cleanup_required=getattr(args, "require_forge_cleanup", False),
         )
+        proxy.ollama_upstream = getattr(args, "ollama_upstream", proxy.ollama_upstream)
+        proxy.comfyui_upstream = runtime.managed_comfyui.upstream
         if args.command in {"run", "tui"}:
             configs = _http_configs(args, runtime, comfyui_upstream)
         if args.command == "run":

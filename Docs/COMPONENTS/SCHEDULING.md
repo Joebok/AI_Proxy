@@ -100,3 +100,12 @@ override do not have separate scenarios.
 
 Related: [contracts](../INVARIANTS.md),
 [shared execution ADR](../DECISIONS/0002-shared-execution-and-backend-ownership.md).
+
+## Independent cloud lane (2026-10-16)
+The preceding expensive-work arbitration applies to the local Ollama/ComfyUI slot.
+Trusted Codex registrations are excluded from local file selection and resource
+hints. `Proxy.cloud_dispatch` independently scans and admits up to the configured
+two-default cloud workers, including while local/HTTP work is active. Admission
+starts only after interrupted-job recovery. It does not touch backend preparation
+or local affinity and waits for admitted workers during shutdown. See
+[native providers](AI_PROVIDERS.md) for failure fencing and configuration.
