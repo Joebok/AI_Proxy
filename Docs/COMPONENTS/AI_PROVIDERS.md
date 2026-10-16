@@ -71,3 +71,15 @@ workers to verify the frozen text/image/schema interface, cloud/local overlap,
 two-slot admission, third-job deferral, terminal publication and interrupted recovery.
 Existing ComfyUI HTTP settlement/cache and non-preemption scenarios remain intact.
 No live provider access or production rollout is established by these scenarios.
+
+
+## Native worker launch environment
+
+Native Zet registrations use `${AI_PROXY_PYTHON}` and
+`${AI_PROXY_PROJECT_ROOT}`. Registry expansion resolves these reserved values to
+the running proxy's `sys.executable` and installed package root, independent of
+PATH, environment overrides or the launcher's current directory. Legacy app
+registrations retain their original subscriber environment. Restart the proxy to
+load changed registrations; a failed execution remains terminal and an explicit
+workflow retry creates a new attempt. Native registration smoke checks may use
+`--help` without invoking any provider.

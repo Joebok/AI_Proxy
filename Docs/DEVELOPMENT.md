@@ -157,3 +157,20 @@ history. A transient Windows state-read sharing violation was found and repaired
 before the final Zet baseline passed. No dependencies or live backend calls were
 added. Upgrade AI_Proxy registrations before migrated Zet; no production rollout
 was performed. See the [completed plan](../plans/completed/2026-10-16-unified-ai-jobs.md).
+
+
+## Native worker interpreter correction (2026-10-16)
+
+Recent creative Codex/Ollama attempts failed at worker launch. Reproducing the
+shipped `python3 -m file_proxy.ai_worker --help` command showed system Python lacked
+`aiohttp`, while the proxy virtual environment succeeded. Native registrations now
+resolve the running interpreter and package directory through reserved registry
+placeholders. Legacy registrations are unchanged. Nonzero worker exits retain a
+bounded stderr tail in their transport error for future durable receipts.
+
+Disposable smoke checks loaded the shipped registry and invoked all three native
+commands with `--help`: passed without provider calls. The existing proxy suite
+passed: 6 passed, 1 live scenario deselected (9.10s). Python AST, registration JSON
+and `git diff --check` passed. No runtime restart, failed-job replay or production
+backend call was performed. Restart the proxy to load registrations and explicitly
+retry affected workflow jobs; their original failed receipts remain history.

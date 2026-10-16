@@ -491,6 +491,8 @@ class Proxy:
                 status = "FAILED"
                 error_type = "WORKER_EXIT"
                 error_message = f"Worker exited with code {completed.returncode}."
+                if stderr.strip():
+                    error_message += " " + stderr.strip()[-2000:]
         except BackendUnavailable:
             pass
         except subprocess.TimeoutExpired as exc:

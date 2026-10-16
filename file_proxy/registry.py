@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 
 from .models import WorkerRegistration, validate_identifier
 
@@ -57,6 +58,11 @@ class Registry:
 
         def replace(match: re.Match[str]) -> str:
             name = match.group(1)
+            # Native workers must use the runtime's dependencies and package root.
+            if name == "AI_PROXY_PYTHON":
+                return sys.executable
+            if name == "AI_PROXY_PROJECT_ROOT":
+                return str(Path(__file__).resolve().parent.parent)
             resolved = os.environ.get(name)
             if resolved is None:
                 raise ValueError(f"registry {path} requires environment variable {name}")
