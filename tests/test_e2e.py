@@ -352,7 +352,7 @@ def test_comfyui_settlement_handoff_and_cached_result_survive_restart(tmp_path: 
             enabled=True, executable=sys.executable, script=str(comfy_script),
             arguments=("--port", str(comfy_port), "--input-directory", str(input_dir), "--output-directory", str(output_dir), "--history-gate", str(settlement), "--prompt-marker", str(prompt_marker)),
             working_directory=str(tmp_path), upstream=f"http://127.0.0.1:{comfy_port}",
-            startup_deadline_seconds=5, startup_cooldown_seconds=0, idle_shutdown_seconds=30, shutdown_deadline_seconds=2,
+            startup_deadline_seconds=5, startup_cooldown_seconds=0, idle_shutdown_seconds=0.1, shutdown_deadline_seconds=2,
         )
         runtime = RuntimeConfig(runtime_dir=str(runtime_dir), managed_comfyui=comfy_config, generation_settlement_seconds=5)
         comfy_listener, ollama_listener = unused_port(), unused_port()
@@ -380,6 +380,10 @@ def test_comfyui_settlement_handoff_and_cached_result_survive_restart(tmp_path: 
                 manager = state.backend_manager
                 assert manager is not None and manager.ownership == "proxy"
                 owned_pid = manager.status()["pid"]
+                await wait_for(lambda: manager.active_backend is None, description="ComfyUI discovery release")
+                # The legacy idle timeout must not stop the backend before the render.
+                await asyncio.sleep(0.3)
+                assert manager.status()["pid"] == owned_pid and manager.state == "ready"
                 output = output_dir / "render.png"
                 output.write_bytes(b"small controlled image")
                 prompt_task = asyncio.create_task(client.post(f"http://127.0.0.1:{comfy_listener}/prompt", json={"prompt": {"1": {"inputs": {}}}}))

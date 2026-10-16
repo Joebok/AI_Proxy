@@ -16,7 +16,7 @@ process. Standard file renders can use managed mode without a ComfyUI HTTP liste
 
 ## Backend transition workflow
 
-`prepare_for` refuses work if blocked, cancels idle shutdown, prepares the selected
+`prepare_for` refuses work if blocked, prepares the selected
 backend, then records active backend/job. ComfyUI work calls `ensure_comfyui`:
 
 1. Under async lock, probe `/queue`; a live owned healthy process is reused.
@@ -37,10 +37,15 @@ Windows starts hidden and suspended, assigns a kill-on-close Job Object for
 descendants, then resumes the process. Non-Windows termination addresses the
 process; equivalent descendant containment is not implemented/verified.
 
-`released` clears active identity; successful managed ComfyUI reuse schedules an
-idle-stop task. Next work cancels it; `close` cancels idle timer and closes owned
-backend. Backend logs rotate by size into local runtime and maintain recent log/
-transition deques. Health probes run concurrently: Ollama `/api/ps` for reachability
+`released` clears active identity and leaves a live owned ComfyUI process ready
+for reuse indefinitely while idle. There is no idle-stop task; legacy
+`idle_shutdown_seconds` values are accepted but ignored. Only scheduled Ollama
+handoff, shutdown (`close`), or failure recovery stops the owned backend. This
+retains memory to reduce subsequent image startup latency without changing queue
+ordering or preempting active work. ComfyUI starts on demand; completing Ollama
+work does not proactively restart it. Backend logs rotate by size into local
+runtime and maintain recent log and transition deques. Health probes run
+concurrently: Ollama `/api/ps` for reachability
 and model residency, ComfyUI `/queue` plus port fallback for ownership conflict.
 Ready listener, reachable endpoint, healthy endpoint, and owned process are
 different observations; do not equate them.
@@ -94,8 +99,9 @@ process startup/stop, keyed prompt settlement, Ollama scheduling handoff and
 cached history/artifact survival after restart. The dashboard scenario verifies
 interrupted recovery and worker-safe restart. [Opt-in live lifecycle scenario](../../tests/test_live_backends.py)
 checks installed Ollama residency and managed ComfyUI model discovery, handoff and
-idle stop. Real generation, Dropbox and non-Windows process containment remain
+idle retention. Real generation, Dropbox and non-Windows process containment remain
 unverified.
 
 Related: [contracts](../INVARIANTS.md),
 [execution ownership ADR](../DECISIONS/0002-shared-execution-and-backend-ownership.md).
+Idle residency policy: [ADR 0003](../DECISIONS/0003-retain-idle-comfyui.md).

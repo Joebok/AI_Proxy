@@ -21,6 +21,7 @@ documentation records verified structure and explicitly labeled gaps.
 | [Reasoning policy](COMPONENTS/REASONING_POLICY.md) | What alias metadata rewrites `reasoning_effort`, and how does hot reload behave? Read for normalization changes. |
 | [Transport boundary ADR](DECISIONS/0001-transport-and-local-state.md) | Why are worker code and application state outside the queue? Read for integration or persistence redesign. |
 | [Execution ownership ADR](DECISIONS/0002-shared-execution-and-backend-ownership.md) | Why does a prompt hold the slot past its HTTP response, and who owns processes? Read for lifecycle redesign. |
+| [Idle ComfyUI residency ADR](DECISIONS/0003-retain-idle-comfyui.md) | Why does managed ComfyUI stay loaded while idle, and which transitions still stop it? Read for residency policy changes. |
 | [Planning convention](../plans/README.md) | When is a plan required, how large is a work packet, and how is it archived? Read before substantial work. |
 | [Plan template](../plans/TEMPLATE.md) | What information makes a plan executable by another agent? Copy for substantial work. |
 | [Knowledge-base completion record](../plans/completed/2026-10-11-agent-knowledge-base.md) | What was inspected/created and what was actually validated for this baseline? Read when auditing these docs. |

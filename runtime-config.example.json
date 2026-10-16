@@ -17,7 +17,6 @@
     "upstream": "http://127.0.0.1:8188",
     "startup_deadline_seconds": 180,
     "startup_cooldown_seconds": 30,
-    "idle_shutdown_seconds": 60,
     "shutdown_deadline_seconds": 15
   },
   "generation_settlement_seconds": 7500,

@@ -55,7 +55,6 @@ class BackendManager:
         self._lock = asyncio.Lock()
         self._cooldown_until = 0.0
         self._logs: deque[str] = deque(maxlen=200)
-        self._idle_task: asyncio.Task[None] | None = None
         self._log_thread: threading.Thread | None = None
         self._transitions: deque[dict[str, object]] = deque(maxlen=50)
 
@@ -132,9 +131,6 @@ class BackendManager:
     async def prepare_for(self, backend: str | None, *, ollama_upstream: str | None = None, job_id: str | None = None) -> None:
         if self.blocked_reason:
             raise BackendUnavailable(self.blocked_reason)
-        if self._idle_task:
-            self._idle_task.cancel()
-            self._idle_task = None
         if backend == "comfyui":
             await self.ensure_comfyui(ollama_upstream or self.ollama_upstream)
         elif backend == "ollama" and self.config.enabled:
@@ -147,22 +143,12 @@ class BackendManager:
     async def released(self, backend: str | None) -> None:
         self.active_backend = None
         self.active_job = None
-        if self.config.enabled and backend == "comfyui" and self._process and self._process.poll() is None:
+        if self.config.enabled and self._process and self._process.poll() is None:
             self._set_state("ready")
-            self._idle_task = asyncio.create_task(self._idle_stop(), name="comfyui-idle-stop")
         elif self.config.enabled:
             self._set_state("stopped")
         elif not self.config.enabled:
             self._set_state("ready")
-
-    async def _idle_stop(self) -> None:
-        try:
-            await asyncio.sleep(self.config.idle_shutdown_seconds)
-            if self.active_backend is None:
-                await self.stop_comfyui()
-                self.logger("Stopped managed ComfyUI after its idle interval")
-        except asyncio.CancelledError:
-            return
 
     async def ensure_comfyui(self, ollama_upstream: str | None = None) -> None:
         if not self.config.enabled:
@@ -464,7 +450,5 @@ class BackendManager:
             self._job_handle = None
 
     async def close(self) -> None:
-        if self._idle_task:
-            self._idle_task.cancel()
         if self.config.enabled and self._process is not None:
             await self.stop_comfyui()

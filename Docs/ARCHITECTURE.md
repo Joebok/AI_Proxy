@@ -73,7 +73,7 @@ effort normalization -> enqueue -> scheduler signals `started` -> upstream relay
 the submission response and reconcile history before releasing the slot. Ollama
 streams hold the slot through relay completion. See [HTTP transport](COMPONENTS/HTTP_TRANSPORT.md).
 
-Other asynchronous work: ComfyUI readiness/history polling, idle shutdown tasks,
+Other asynchronous work: ComfyUI readiness/history polling,
 concurrent backend health probes, and dashboard refreshes. Managed process stdout
 is captured in a background thread. SQLite opens per-operation connections under
 an `RLock`; the runtime does not persist undispatched HTTP request bodies.

@@ -59,9 +59,8 @@ is interpreted by the host process, not relative to the registry file. Registry
 validation lists worker names; it does not execute commands or prove dependencies
 are installed. Registry is loaded once; restart after changes.
 
-Included registrations: [Zet](../registries/zet.json) declares trusted backend
-families; [Checkpoint Lab](../registries/checkpoint_lab.json) has no backend
-declarations. Managed-mode jobs must resolve a backend via registration or a
+The included registration, [Zet](../registries/zet.json), declares trusted backend
+families. Managed-mode jobs must resolve a backend via registration or a
 recognized resource key; otherwise they are held.
 
 ## Runtime and listener configuration
@@ -90,7 +89,7 @@ before that override. `once` does not enable backend management.
 | Settlement | 7,500 s generation/upstream timeout, 30 s cancellation grace; listener history polls default 1 s. |
 | Scheduling | Streak 5, HTTP oldest override 60 s; file polling 1 s and sync grace 300 s from CLI. Listener continuation grace 2 s. |
 | Retention | Lifecycle/cache terminal records 7 days, cache 10 GiB; HTTP diagnostics 3 UTC days. Cache eviction runs during archive and shutdown, not a permanent background sweep. Diagnostics cleanup runs on logger construction and day changes. |
-| Managed process | Disabled by default; startup deadline 180 s, cooldown 30 s, idle stop 60 s, shutdown deadline 15 s; logs rotate at 4 MiB with 3 backups. |
+| Managed process | Disabled by default; startup deadline 180 s, cooldown 30 s, no idle stop, shutdown deadline 15 s; logs rotate at 4 MiB with 3 backups. Legacy `idle_shutdown_seconds` is accepted but ignored. |
 | Reasoning policy | Optional `ollama_reasoning_policy_path`; absent means no alias normalization. Format and reload contract: [REASONING_POLICY.md](COMPONENTS/REASONING_POLICY.md). |
 
 [runtime-config.example.json](../runtime-config.example.json) is a local deployment

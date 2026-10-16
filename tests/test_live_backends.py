@@ -121,8 +121,9 @@ def test_installed_ollama_and_managed_comfyui_lifecycle(pytestconfig: pytest.Con
                 await _request_json(session, "GET", f"http://127.0.0.1:{comfy_listener_port}/object_info/CheckpointLoaderSimple")
                 next_pid = int(manager.status()["pid"])
                 assert next_pid != owned_pid
-                await wait_for(lambda: manager.status()["pid"] is None, timeout=15, description="ComfyUI idle shutdown")
-                assert_process_dead(next_pid)
+                await wait_for(lambda: manager.active_backend is None, description="ComfyUI discovery release")
+                await asyncio.sleep(3)
+                assert manager.status()["pid"] == next_pid and manager.state == "ready"
         finally:
             task.cancel()
             try:
@@ -138,6 +139,7 @@ def test_installed_ollama_and_managed_comfyui_lifecycle(pytestconfig: pytest.Con
                         await wait_for(lambda: _ollama_empty(cleanup, ollama_upstream), timeout=30, description="live test Ollama cleanup")
                 except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                     pytest.fail(f"Could not unload the test-owned Ollama model during cleanup: {exc}")
+        assert_process_dead(next_pid)
 
     asyncio.run(scenario())
 

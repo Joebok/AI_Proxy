@@ -80,8 +80,8 @@ directories. `validate-subscriber` loads the entire registry before listing one
 subscriber and does not test command launch.
 
 Registry loading requires every referenced environment variable and cwd to exist.
-Included registries require `ZET_PROJECT_ROOT` and `CHECKPOINT_LAB_PROJECT_ROOT`;
-the standard launchers supply only a default Zet root. For an isolated test
+The included registry requires `ZET_PROJECT_ROOT`;
+the standard launchers supply a default Zet root. For an isolated test
 deployment, select a registry directory containing only the intended registrations.
 
 [run_file_proxy.ps1](../run_file_proxy.ps1) and [run_file_proxy.bat](../run_file_proxy.bat)

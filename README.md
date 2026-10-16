@@ -772,9 +772,11 @@ Zet stages ComfyUI render requests through the filesystem queue. The standard
 `run_file_proxy.ps1` and `.bat` launchers do not start a ComfyUI HTTP proxy.
 When managed mode is enabled in `AI_PROXY_RUNTIME_CONFIG`, AI_Proxy starts the
 configured ComfyUI Python process for file jobs, unloads resident Ollama models
-before startup, stops owned ComfyUI before Ollama work, reuses ComfyUI for
-consecutive image jobs, and stops it after the idle interval. It never adopts
-or terminates a manually started ComfyUI instance.
+before startup, and stops owned ComfyUI before Ollama work. Once started, ComfyUI
+stays loaded while idle and is reused for later image jobs. It stops for Ollama
+handoff, proxy shutdown, or failure recovery. The legacy `idle_shutdown_seconds`
+setting is accepted but ignored. It never adopts or terminates a manually
+started ComfyUI instance.
 
 Managed mode remains disabled in the example config. Copy and review
 `runtime-config.example.json`, then enable it in a local private config and set

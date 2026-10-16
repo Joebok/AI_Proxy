@@ -18,7 +18,7 @@ class ManagedComfyUIConfig:
     upstream: str = "http://127.0.0.1:8188"
     startup_deadline_seconds: float = 180.0
     startup_cooldown_seconds: float = 30.0
-    idle_shutdown_seconds: float = 60.0
+    idle_shutdown_seconds: float = 60.0  # Legacy setting, ignored; retain for config compatibility.
     shutdown_deadline_seconds: float = 15.0
     log_max_bytes: int = 4 * 1024 * 1024
     log_backups: int = 3
