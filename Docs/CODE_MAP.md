@@ -33,6 +33,8 @@ behavior. Do not assume README example code is imported here.
 
 ## Native AI boundary (2026-10-16)
 - `ai_worker.py` owns generic Codex/Ollama/ComfyUI invocation and result manifests.
+- Its CLI now returns nonzero for failed native execution, classifies concise
+  Codex diagnostics, and journals ComfyUI's accepted identity before polling.
 - `Proxy.cloud_dispatch` owns trusted cloud admission; local scheduler and resource
   affinity exclude Codex. Runtime configuration owns cloud capacity and Codex names.
 - `model_catalog.py` owns shared capability metadata, with HTTP metadata access in

@@ -72,6 +72,23 @@ two-slot admission, third-job deferral, terminal publication and interrupted rec
 Existing ComfyUI HTTP settlement/cache and non-preemption scenarios remain intact.
 No live provider access or production rollout is established by these scenarios.
 
+### Terminal outcomes and prompt identity
+
+Native worker CLI failure exits nonzero after writing its structured failed
+answer; the engine consequently publishes a failed transport outcome as well.
+Subscribers must independently require successful transport and worker outcomes.
+Codex quota errors use `PROVIDER_QUOTA_EXCEEDED` and other CLI failures use
+`CODEX_EXECUTION_FAILED`, with a concise diagnostic instead of echoed prompt text.
+ComfyUI terminal errors use `COMFYUI_EXECUTION_FAILED` with node/type diagnostics;
+the retained keyed history owns detailed execution evidence.
+No execution is automatically retried. ComfyUI's actual accepted prompt ID is
+journaled before keyed history polling; ambiguity retains the local unresolved
+submission guard. Local/cloud scheduling capacity is unchanged.
+
+2026-10-16 validation: all six existing isolated E2E scenarios passed in 8.80 seconds;
+no scenario was added or expanded. Live quota exhaustion, provider responses and
+installed ComfyUI execution were not exercised.
+
 
 ## Native worker launch environment
 

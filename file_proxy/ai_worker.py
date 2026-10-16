@@ -16,6 +16,12 @@ from .models import iso_utc, utc_now
 from .validation import validate_relative_reference
 
 
+class ProviderError(RuntimeError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
 def write_json(path: Path, value) -> None:
     temporary = path.with_name("." + path.name + "." + uuid4().hex + ".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
@@ -111,7 +117,13 @@ def run_codex(root, request, output, executable=None):
                                timeout=float(request.get("options", {}).get("timeout_seconds", 1800)),
                                check=False, shell=False)
     if completed.returncode:
-        raise RuntimeError((completed.stderr or completed.stdout or "Codex failed")[-4000:])
+        # CLI stderr may include the entire prompt. Surface only an error diagnostic.
+        diagnostic = completed.stderr or completed.stdout or ""
+        if "usage limit" in diagnostic.lower() or "quota exceeded" in diagnostic.lower():
+            raise ProviderError("PROVIDER_QUOTA_EXCEEDED", "Codex usage limit reached. Retry explicitly when capacity is available.")
+        errors = [line.strip() for line in diagnostic.splitlines() if line.strip().startswith("ERROR:")]
+        message = errors[-1][:600] if errors else f"Codex exited with code {completed.returncode}."
+        raise ProviderError("CODEX_EXECUTION_FAILED", message)
     if not output.is_file():
         raise ValueError("Codex did not publish its final answer")
     return {"provider": "codex", "effective_model": request["model"]}
@@ -180,6 +192,9 @@ def run_comfyui(root, request, output, upstream):
     write_json(root / "comfyui_submission.json", {"prompt_id": prompt_id, "settled": False, "workflow": graph})
     accepted = http_json(upstream + "/prompt", {"prompt": graph, "prompt_id": prompt_id, "client_id": str(uuid4())})
     prompt_id = accepted.get("prompt_id", prompt_id)
+    if not isinstance(prompt_id, str) or not prompt_id:
+        raise ValueError("ComfyUI returned an invalid prompt identity; submission remains unresolved")
+    write_json(root / "comfyui_submission.json", {"prompt_id": prompt_id, "settled": False, "workflow": graph})
     deadline = time.monotonic() + float(request.get("options", {}).get("timeout_seconds", 7500))
     while time.monotonic() < deadline:
         entry = http_json(upstream + "/history/" + prompt_id).get(prompt_id)
@@ -188,7 +203,13 @@ def run_comfyui(root, request, output, upstream):
             write_json(root / "comfyui_history.json", entry)
             status = entry.get("status", {})
             if status.get("status_str") not in {"success", "succeeded"}:
-                raise RuntimeError("ComfyUI execution failed: " + json.dumps(status)[-2000:])
+                failure = next((message[1] for message in status.get("messages", [])
+                                if isinstance(message, list) and len(message) == 2
+                                and message[0] == "execution_error" and isinstance(message[1], dict)), {})
+                node = str(failure.get("node_id", "unknown"))[:80]
+                kind = str(failure.get("exception_type", "execution error"))[:120]
+                raise ProviderError("COMFYUI_EXECUTION_FAILED",
+                                    f"ComfyUI failed at node {node} ({kind}). See comfyui_history.json for details.")
             images = [image for value in entry.get("outputs", {}).values() for image in value.get("images", [])]
             if not images:
                 raise ValueError("ComfyUI returned no output image")
@@ -238,7 +259,7 @@ def execute(root: Path, provider: str, *, codex=None, ollama=None, comfyui=None)
         if provider == "ollama":
             result["ollama_runtime"] = runtime
     except Exception as exc:
-        result.update(status="FAILED", error_type=type(exc).__name__, error_message=str(exc)[-4000:])
+        result.update(status="FAILED", error_type=getattr(exc, "code", type(exc).__name__), error_message=str(exc)[-4000:])
     result["completed_at"] = iso_utc(utc_now())
     write_json(root / "answer_manifest.json", result)
     write_json(root / "ai_result.json", result)
@@ -250,7 +271,7 @@ def main():
     parser.add_argument("--job-dir", required=True, type=Path)
     parser.add_argument("--provider", required=True, choices=("codex", "ollama", "comfyui"))
     args = parser.parse_args()
-    execute(args.job_dir, args.provider)
+    raise SystemExit(0 if execute(args.job_dir, args.provider) else 1)
 
 
 if __name__ == "__main__":

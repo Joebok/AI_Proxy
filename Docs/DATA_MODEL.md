@@ -132,6 +132,11 @@ a filesystem scan. Full transactional filesystem/database recovery and orphan
 cleanup are not established; do not promise them.
 
 ## Native provider extension (2026-10-16)
+
+Native failed answers retain version 1 and carry a nonzero worker exit status.
+`error_type` may be `PROVIDER_QUOTA_EXCEEDED` or `CODEX_EXECUTION_FAILED` for Codex
+CLI failures. `comfyui_submission.json` records the actual accepted prompt ID
+before polling, with `settled: false` until keyed history is observed.
 `ai_request.json` and `ai_result.json` are version-1 payloads in the existing envelope;
 job protocol version is unchanged. Trusted `backend=codex` selects the cloud lane.
 `cloud_concurrency` is a positive integer, default two; `codex_models` is a configured
