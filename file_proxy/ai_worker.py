@@ -24,8 +24,29 @@ class ProviderError(RuntimeError):
 
 def write_json(path: Path, value) -> None:
     temporary = path.with_name("." + path.name + "." + uuid4().hex + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(temporary, path)
+
+
+def save_submission(root, submission):
+    local = os.environ.get("AI_PROXY_RUNTIME_DIR")
+    metadata = {key: submission.get(key) for key in ("prompt_id", "settled", "phase")}
+    metadata.update(job_id=root.name, reason="Native ComfyUI submission requires settlement")
+    state = os.environ.get("AI_PROXY_EXECUTION_STATE")
+    if state:
+        write_json(Path(state).with_suffix(".submission.json"), metadata)
+    if local:
+        guard = Path(local) / "unsettled_comfyui.json"
+        if not submission["settled"]:
+            write_json(guard, metadata)
+        elif guard.is_file():
+            saved = json.loads(guard.read_text(encoding="utf-8"))
+            if saved.get("job_id") == root.name:
+                guard.unlink()
+    write_json(root / "comfyui_submission.json", submission)
 
 
 def local_file(root: Path, name: str) -> Path:
@@ -189,17 +210,24 @@ def run_comfyui(root, request, output, upstream):
         graph[str(binding["node"])]["inputs"][binding.get("input", "image")] = image
     # Persist exact submission identity before sending; an ambiguous submission is never replayed.
     prompt_id = str(uuid4())
-    write_json(root / "comfyui_submission.json", {"prompt_id": prompt_id, "settled": False, "workflow": graph})
+    save_submission(root, {"prompt_id": prompt_id, "settled": False, "phase": "PREPARED", "workflow": graph})
+    # Record the ambiguity boundary on local storage before sending the POST.
+    local = os.environ.get("AI_PROXY_RUNTIME_DIR")
+    dispatch = {"job_id": root.name, "prompt_id": prompt_id, "settled": False, "phase": "DISPATCHING"}
+    if os.environ.get("AI_PROXY_EXECUTION_STATE"):
+        write_json(Path(os.environ["AI_PROXY_EXECUTION_STATE"]).with_suffix(".submission.json"), dispatch)
+    if local:
+        write_json(Path(local) / "unsettled_comfyui.json", dispatch)
     accepted = http_json(upstream + "/prompt", {"prompt": graph, "prompt_id": prompt_id, "client_id": str(uuid4())})
     prompt_id = accepted.get("prompt_id", prompt_id)
     if not isinstance(prompt_id, str) or not prompt_id:
         raise ValueError("ComfyUI returned an invalid prompt identity; submission remains unresolved")
-    write_json(root / "comfyui_submission.json", {"prompt_id": prompt_id, "settled": False, "workflow": graph})
+    save_submission(root, {"prompt_id": prompt_id, "settled": False, "phase": "ACCEPTED", "workflow": graph})
     deadline = time.monotonic() + float(request.get("options", {}).get("timeout_seconds", 7500))
     while time.monotonic() < deadline:
         entry = http_json(upstream + "/history/" + prompt_id).get(prompt_id)
         if entry:
-            write_json(root / "comfyui_submission.json", {"prompt_id": prompt_id, "settled": True, "workflow": graph})
+            save_submission(root, {"prompt_id": prompt_id, "settled": True, "phase": "SETTLED", "workflow": graph})
             write_json(root / "comfyui_history.json", entry)
             status = entry.get("status", {})
             if status.get("status_str") not in {"success", "succeeded"}:
@@ -232,14 +260,15 @@ def legacy_request(root, ask, provider):
 
 
 def execute(root: Path, provider: str, *, codex=None, ollama=None, comfyui=None) -> bool:
-    ask = json.loads((root / "ask_manifest.json").read_text(encoding="utf-8"))
-    path = root / "ai_request.json"
-    request = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else legacy_request(root, ask, provider)
-    result = {"version": 1, "ask_id": ask["ask_id"], "worker_id": "ai-proxy-" + provider,
-              "asset_id": ask.get("asset_id"), "source_ask_id": ask.get("source_ask_id", ""),
-              "expected_output": request.get("output", "answer.json"), "started_at": iso_utc(utc_now()),
-              "ollama_attempt_id": ask.get("ollama_attempt_id", ask["ask_id"]), "requested_model": request.get("model", "")}
+    result = {"version": 1, "ask_id": root.name, "worker_id": "ai-proxy-" + provider,
+              "started_at": iso_utc(utc_now())}
     try:
+        ask = json.loads((root / "ask_manifest.json").read_text(encoding="utf-8"))
+        path = root / "ai_request.json"
+        request = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else legacy_request(root, ask, provider)
+        result.update(ask_id=ask["ask_id"], asset_id=ask.get("asset_id"), source_ask_id=ask.get("source_ask_id", ""),
+                      expected_output=request.get("output", "answer.json"), ollama_attempt_id=ask.get("ollama_attempt_id", ask["ask_id"]),
+                      requested_model=request.get("model", ""))
         if request.get("version") != 1 or request.get("provider") != provider:
             raise ValueError("Request version/provider does not match trusted worker")
         output = local_file(root, result["expected_output"])
@@ -260,7 +289,13 @@ def execute(root: Path, provider: str, *, codex=None, ollama=None, comfyui=None)
             result["ollama_runtime"] = runtime
     except Exception as exc:
         result.update(status="FAILED", error_type=getattr(exc, "code", type(exc).__name__), error_message=str(exc)[-4000:])
+        filename = getattr(exc, "filename", None)
+        if isinstance(exc, OSError) and filename and Path(filename).resolve().is_relative_to(root.resolve()):
+            result.update(recovery_class="STORAGE_UNAVAILABLE", retryable=True)
     result["completed_at"] = iso_utc(utc_now())
+    local = os.environ.get("AI_PROXY_EXECUTION_STATE")
+    if local:
+        write_json(Path(local).with_suffix(".result.json"), result)
     write_json(root / "answer_manifest.json", result)
     write_json(root / "ai_result.json", result)
     return result["status"] == "SUCCESS"

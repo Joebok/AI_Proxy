@@ -34,7 +34,7 @@ class RuntimeSnapshot:
     state: str
     error: str | None
     listeners: tuple[ListenerSnapshot, ...]
-    filesystem_counts: dict[str, int]
+    filesystem_counts: dict[str, int | None]
     http_queued: int
     http_oldest_wait_seconds: float
     admitted_requests: int
@@ -195,19 +195,21 @@ class RuntimeSupervisor:
         self, loop: asyncio.AbstractEventLoop, ready_event: asyncio.Event
     ) -> None:
         assert self._file_stop is not None
-        self.proxy.ensure_layout()
         self.proxy.logger(f"Queue root: {self.proxy.root}")
         with self.proxy.lock():
+            self.proxy._queue_ready()
             self.proxy.logger(f"Lock acquired: {self.proxy.local_runtime_dir / 'proxy.lock'}")
-            recovered = self.proxy.recover_interrupted()
-            if recovered:
-                self.proxy.logger(f"Recovered {recovered} interrupted job(s)")
             with self.proxy.cloud_dispatch(self.poll_seconds):
                 loop.call_soon_threadsafe(ready_event.set)
                 self.proxy.logger(f"Ready; polling every {self.poll_seconds:g}s.")
                 idle = False
                 while not self._file_stop.is_set():
-                    if self.proxy.process_once() is None:
+                    try:
+                        outcome = self.proxy.process_once()
+                    except OSError:
+                        self.proxy._storage_reconciled = False
+                        outcome = None
+                    if outcome is None:
                         if not idle:
                             self.proxy.logger("Queue is idle")
                             idle = True
@@ -277,10 +279,10 @@ class RuntimeSupervisor:
         try:
             filesystem = await asyncio.to_thread(self.proxy.status)
         except OSError as exc:
-            filesystem = {"counts": {}, "jobs": [], "degraded": str(exc)}
-        raw_counts = filesystem.get("counts", {})
+            filesystem = {"counts": None, "jobs": [], "degraded": str(exc)}
+        raw_counts = filesystem.get("counts")
         counts = {
-            key: int(raw_counts.get(key, 0))
+            key: int(raw_counts.get(key, 0)) if isinstance(raw_counts, dict) else None
             for key in ("queued", "running", "succeeded", "failed", "invalid")
         }
         http_state = self._http_state

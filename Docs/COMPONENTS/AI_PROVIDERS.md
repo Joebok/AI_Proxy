@@ -41,8 +41,12 @@ Restart publishes interrupted attempts as failures without replay.
 Local Ollama/ComfyUI ordering, affinity, ownership and non-preemption remain intact.
 An ambiguous native ComfyUI submission saves `unsettled_comfyui.json` in local runtime
 state, blocking subsequent local admission across restart while cloud work can
-continue. Reconcile the saved prompt/stop its backend before explicitly clearing
-that guard; restarting alone must not imply the GPU is free.
+continue. In managed mode the local scheduler automatically stops its owned
+ComfyUI backend and verifies the endpoint is gone before archiving the guard as
+`unsettled_comfyui.recovered-<timestamp>.json` and resuming admission. The original
+failed/interrupted attempt remains terminal; no saved workflow is resubmitted.
+External mode or an unowned reachable backend retains the guard for intervention.
+See [recovery ADR](../DECISIONS/0005-managed-native-comfyui-recovery.md).
 
 ## Capability metadata
 
@@ -100,3 +104,6 @@ registrations retain their original subscriber environment. Restart the proxy to
 load changed registrations; a failed execution remains terminal and an explicit
 workflow retry creates a new attempt. Native registration smoke checks may use
 `--help` without invoking any provider.
+
+## Native storage evidence (2026-10-17)
+Native workers save bounded results locally before shared result publication, including failures while reading their initial envelope. ComfyUI identity/phase is durable locally before POST and settlement remains recorded if shared writes fail. PREPARED proves no POST was sent; DISPATCHING/ACCEPTED retain the existing managed verified-stop/external-held boundary. No task prompts or graphs are copied into local submission metadata. Subscriber-owned fresh attempts are distinct from proxy replay. See [ADR 0006](../DECISIONS/0006-storage-outage-recovery.md).

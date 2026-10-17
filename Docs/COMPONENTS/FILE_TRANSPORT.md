@@ -89,3 +89,13 @@ Native `ai_*` registrations execute `ai_request.json` version 1 while preserving
 protocol-v1 envelope/inventory. Result interpretation/application remains with the
 subscriber. Legacy registrations remain for existing immutable asks. See
 [native providers](AI_PROVIDERS.md) for contracts, cloud scheduling and model metadata.
+
+## Removable-volume recovery (2026-10-17)
+Daemon, filesystem-only, and supervisor startup keep polling a disconnected queue. Health uses fixed-local identity evidence and two successful probes separated by two seconds. Worker hosts journal process identity/exit state before engine publication; known successful outcomes are published after reconnect. No missing job directory is recreated. Interrupted/storage-failed executions carry optional retry classification, but only subscribers create fresh attempts. Status retains known rows and uses null counts during unavailability. See [ADR 0006](../DECISIONS/0006-storage-outage-recovery.md).
+
+Surviving worker hosts retain their execution lane/capacity until exit, including
+when the queue is temporarily absent. Native or witnessed successful outcomes are
+revalidated before publication; genuine known provider errors are not relabeled as
+storage failures merely because an outage overlaps them. Probes have one worker
+per monitor and a bounded status wait; root identity evidence is exclusive across
+local startup processes.

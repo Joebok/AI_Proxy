@@ -89,6 +89,15 @@ listener bind conflict are distinct failures. A recorded `blocked_reason` has no
 automatic operator-clear method; reconcile the external condition and deliberately
 restart a fresh runtime as appropriate. Do not add automatic process adoption.
 
+Native file-worker ambiguity has a separate durable `unsettled_comfyui.json`
+admission guard. The managed scheduler recovers this automatically by calling
+`stop_comfyui`, which stops only owned processes and verifies the endpoint is
+gone. It then archives the guard and continues queued work. A stopped backend
+also satisfies this check after restart. Stop/probe/archive failures keep the
+guard; a reachable unowned process still requires intervention. Failed/interrupted
+attempts retain their terminal outcomes and are never replayed. This recovery
+does not clear arbitrary `blocked_reason` values or change HTTP settlement.
+
 Backend additions need registration/profile validation, lifecycle/health contracts,
 scheduler backend resolution, CLI/TUI configuration and tests; a new name alone is
 insufficient. Dashboard additions should extend `RuntimeSnapshot`, keeping work in

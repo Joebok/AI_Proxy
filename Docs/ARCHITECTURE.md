@@ -100,3 +100,6 @@ external side effects: single-attempt execution is not exactly-once delivery.
   3.10 compatibility were not verified; see development for known gaps.
 
 Native generic AI execution and independent Codex admission are described in [native providers](COMPONENTS/AI_PROVIDERS.md). Only local Ollama/ComfyUI work shares the serialized resource slot; cloud work is independently bounded.
+
+## Removable queues
+Filesystem admission is gated by fixed-local resource health. Startup may remain degraded while listeners/polling continue; reconnect reconciles retained outcomes and running witnesses before admitting file work. Trusted cloud work remains independent of local backend settlement. See [ADR 0006](DECISIONS/0006-storage-outage-recovery.md).

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ from .registry import Registry
 from .scheduler import HttpQueue
 from .backend import BackendManager, BackendUnavailable
 from .validation import build_file_inventory, validate_job_folder
+from .storage_health import StorageHealth, StorageUnavailable
 
 
 class ProxyAlreadyRunning(RuntimeError):
@@ -45,11 +47,13 @@ class RuntimeLock:
         else:
             raise ProxyAlreadyRunning(f"proxy lock already exists: {self.path}")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            from .worker_host import process_identity
             json.dump(
                 {
                     "pid": os.getpid(),
                     "hostname": socket.gethostname(),
                     "started_at": iso_utc(utc_now()),
+                    "process_identity": process_identity(os.getpid()),
                 },
                 handle,
             )
@@ -66,13 +70,8 @@ class RuntimeLock:
             if pid <= 0:
                 return False
             if os.name == "nt":
-                import ctypes
-
-                process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-                if not process:
-                    return False
-                ctypes.windll.kernel32.CloseHandle(process)
-                return True
+                from .worker_host import process_identity, process_alive
+                return process_alive(data["process_identity"]) if data.get("process_identity") else process_identity(pid) is not None
             os.kill(pid, 0)
             return True
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
@@ -86,7 +85,10 @@ class RuntimeLock:
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     temp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    with temp.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     _replace_with_retry(temp, path)
 
 
@@ -170,10 +172,75 @@ class Proxy:
         self.control_root = self.root / "Control"
         self.local_runtime_dir = (local_runtime_dir or (Path.cwd() / ".ai-proxy-runtime")).resolve()
         self._filesystem_degraded: str | None = None
+        queue_key = hashlib.sha256(os.path.normcase(str(self.root)).encode()).hexdigest()[:20]
+        self.storage = StorageHealth(self.local_runtime_dir / ("storage-health-" + queue_key + ".json"), {"queue": self.root})
+        self._storage_reconciled = False
+        self._status_cache = []
+        self._orphan_paths = set()
+        for path in (self.local_runtime_dir / "executions").glob("*/*.json"):
+            if not path.name.endswith((".result.json", ".submission.json")):
+                self._orphan_paths.add(path)
 
     def ensure_layout(self) -> None:
+        self.storage.require("queue")
         for path in (self.ask_root, self.running_root, self.answer_root, self.control_root):
             path.mkdir(parents=True, exist_ok=True)
+
+    def _queue_ready(self) -> bool:
+        try:
+            self.ensure_layout()
+            with self._scan_guard:
+                if not self._storage_reconciled:
+                    self.recover_interrupted()
+                    self._storage_reconciled = True
+            self._filesystem_degraded = None
+            return True
+        except OSError as exc:
+            if self._filesystem_degraded != str(exc):
+                self.logger(f"Filesystem queue paused; retrying automatically: {exc}")
+            self._filesystem_degraded = str(exc)
+            self._storage_reconciled = False
+            self.storage.poll(force=True)
+            return False
+
+    def _execution_path(self, subscriber_id, job_id):
+        return self.local_runtime_dir / "executions" / subscriber_id / (job_id + ".json")
+
+    def _execution_alive(self, subscriber_id, job_id):
+        from .worker_host import process_alive, execution_lock, save
+        path = self._execution_path(subscriber_id, job_id)
+        if not path.is_file():
+            return False
+        with execution_lock(path):
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record.get("phase") == "RESERVED":
+                if process_alive(record.get("proxy")):
+                    return True
+                record["phase"] = "FENCED"
+                save(path, record)
+            return any(process_alive(record.get(key)) for key in ("host", "child"))
+
+    def _orphan_count(self, *, cloud=False):
+        """Surviving hosts retain their lane/capacity even when the old proxy died."""
+        count = 0
+        with self._scan_guard:
+            for path in list(self._orphan_paths):
+                identity = (path.parent.name, path.stem)
+                if identity in self._active_jobs:
+                    continue
+                try:
+                    if not self._execution_alive(*identity):
+                        self._orphan_paths.discard(path)
+                        continue
+                    record = json.loads(path.read_text(encoding="utf-8"))
+                    if (record.get("backend") == "codex") == cloud:
+                        count += 1
+                except FileNotFoundError:
+                    self._orphan_paths.discard(path)
+                except (OSError, ValueError):
+                    if not cloud:
+                        count += 1
+        return count
 
     def lock(self) -> RuntimeLock:
         return RuntimeLock(self.local_runtime_dir / "proxy.lock")
@@ -197,6 +264,25 @@ class Proxy:
         path = self._local_outcome_path(subscriber_id, job_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         _write_json_atomic(path, payload)
+
+    def _restore_outcome(self, folder, payload):
+        if payload.get("status") == "SUCCEEDED":
+            try:
+                validate_job_folder(folder, folder.parent.name, folder.name)
+            except (InvalidJob, JobNotReady) as exc:
+                payload.update(status="FAILED", error_type="INVALID_OUTPUT_STATE", error_message=str(exc),
+                               retryable=False, recovery_class="", output_files=None)
+            native_path = self._execution_path(folder.parent.name, folder.name).with_suffix(".result.json")
+            if native_path.is_file() and payload["status"] == "SUCCEEDED":
+                native = json.loads(native_path.read_text(encoding="utf-8"))
+                output = native.get("expected_output", "")
+                if output and Path(output).name == output and not (folder / output).is_file():
+                    payload.update(status="FAILED", error_type="OUTPUT_UNAVAILABLE", output_files=None,
+                                   error_message="Completed output is unavailable after interruption", retryable=True,
+                                   recovery_class="EXECUTION_INTERRUPTED")
+        if payload.get("output_files") is None:
+            payload["output_files"] = _inventory_with_retry(folder)
+        _write_json_atomic(folder / "proxy_result.json", payload)
 
     def _invalid(self, path: Path, subscriber_id: str, job_id: str, message: str) -> Path:
         self.logger(f"Invalid job {subscriber_id}/{job_id}: {message}")
@@ -222,13 +308,54 @@ class Proxy:
         return self._move_to_answer(path, subscriber_id, job_id)
 
     def recover_interrupted(self) -> int:
+        self.storage.require("queue")
         recovered = 0
         for subscriber_dir in sorted(path for path in self.running_root.iterdir() if path.is_dir()):
             for job_dir in sorted(path for path in subscriber_dir.iterdir() if path.is_dir()):
+                if ((subscriber_dir.name, job_dir.name) in self._active_jobs
+                        or self._execution_alive(subscriber_dir.name, job_dir.name)):
+                    continue
+                native_result = self._execution_path(subscriber_dir.name, job_dir.name).with_suffix(".result.json")
+                witness_path = self._execution_path(subscriber_dir.name, job_dir.name)
+                if witness_path.is_file() and not self._local_outcome_path(subscriber_dir.name, job_dir.name).is_file():
+                    witness = json.loads(witness_path.read_text(encoding="utf-8"))
+                    if witness.get("phase") == "EXITED":
+                        code = witness.get("exit_code")
+                        payload = {"protocol_version": 1, "job_id": job_dir.name, "subscriber_id": subscriber_dir.name,
+                            "worker": "", "status": "SUCCEEDED" if code == 0 else "FAILED",
+                            "started_at": iso_utc(utc_now()), "completed_at": iso_utc(utc_now()),
+                            "duration_seconds": 0, "exit_code": code, "output_files": None,
+                            "error_type": None if code == 0 else "WORKER_EXIT",
+                            "error_message": "" if code == 0 else f"Worker exited with code {code}."}
+                        if native_result.is_file():
+                            native = json.loads(native_result.read_text(encoding="utf-8"))
+                            if native.get("retryable"):
+                                payload.update(recovery_class=native["recovery_class"], retryable=True)
+                            if native.get("status") == "SUCCESS":
+                                payload.update(status="SUCCEEDED", error_type=None, error_message="")
+                            elif code not in {0, 124} and native.get("error_type") in {"URLError", "ConnectionError", "OSError"}:
+                                payload.update(recovery_class="EXECUTION_INTERRUPTED", retryable=True)
+                        elif code not in {0, 124}:
+                            payload.update(recovery_class="EXECUTION_INTERRUPTED", retryable=True)
+                        self._persist_local_outcome(subscriber_dir.name, job_dir.name, payload)
+                if native_result.is_file():
+                    native = json.loads(native_result.read_text(encoding="utf-8"))
+                    if not (job_dir / "answer_manifest.json").is_file():
+                        _write_json_atomic(job_dir / "answer_manifest.json", native)
+                    output = native.get("expected_output", "")
+                    if (native.get("status") == "SUCCESS" and output and Path(output).name == output
+                            and (job_dir / output).is_file()
+                            and not self._local_outcome_path(subscriber_dir.name, job_dir.name).is_file()):
+                        self._persist_local_outcome(subscriber_dir.name, job_dir.name, {
+                            "protocol_version": 1, "job_id": job_dir.name, "subscriber_id": subscriber_dir.name,
+                            "worker": "", "status": "SUCCEEDED", "started_at": native["started_at"],
+                            "completed_at": native["completed_at"], "duration_seconds": 0, "exit_code": 0,
+                            "output_files": None})
                 self._preserve_unsettled_backend(job_dir)
                 local_outcome = self._local_outcome_path(subscriber_dir.name, job_dir.name)
                 if local_outcome.is_file() and not (job_dir / "proxy_result.json").is_file():
-                    _write_json_atomic(job_dir / "proxy_result.json", json.loads(local_outcome.read_text(encoding="utf-8")))
+                    payload = json.loads(local_outcome.read_text(encoding="utf-8"))
+                    self._restore_outcome(job_dir, payload)
                 if (job_dir / "proxy_result.json").is_file():
                     self._move_to_answer(job_dir, subscriber_dir.name, job_dir.name)
                     self.logger(f"Published previously completed job {subscriber_dir.name}/{job_dir.name}")
@@ -255,13 +382,14 @@ class Proxy:
                     error_message="Proxy stopped while this job was running; the job was not retried.",
                     output_files=_inventory_with_retry(job_dir),
                 )
-                _write_json_atomic(job_dir / "proxy_result.json", result.to_dict())
+                _write_json_atomic(job_dir / "proxy_result.json", {**result.to_dict(), "recovery_class": "EXECUTION_INTERRUPTED", "retryable": True})
                 self._move_to_answer(job_dir, subscriber_dir.name, job_dir.name)
                 self.logger(f"Recovered interrupted job {subscriber_dir.name}/{job_dir.name} as FAILED")
                 recovered += 1
         return recovered
 
     def _scan(self) -> tuple[list[QueueJob], list[tuple[Path, str, str, str]]]:
+        self.storage.require("queue")
         jobs: list[QueueJob] = []
         invalid: list[tuple[Path, str, str, str]] = []
         for subscriber_dir in sorted(path for path in self.ask_root.iterdir() if path.is_dir()):
@@ -310,9 +438,15 @@ class Proxy:
         self,
         *, include_cloud: bool = False,
     ) -> QueueJob | tuple[Path, str, str, str] | None:
+        if not self._queue_ready():
+            return None
         while self._publish_completed_running():
             pass
         jobs, invalid = self._scan()
+        if self._orphan_count():
+            jobs = [job for job in jobs if self._file_job_backend(job) == "codex"]
+        if self._orphan_count(cloud=True) >= self.cloud_concurrency:
+            jobs = [job for job in jobs if self._file_job_backend(job) != "codex"]
         if not include_cloud:
             jobs = [job for job in jobs if self._file_job_backend(job) != "codex"]
         if invalid:
@@ -326,11 +460,16 @@ class Proxy:
             return False
         for subscriber_dir in sorted(path for path in self.running_root.iterdir() if path.is_dir()):
             for job_dir in sorted(path for path in subscriber_dir.iterdir() if path.is_dir()):
-                if (subscriber_dir.name, job_dir.name) in self._active_jobs:
+                if ((subscriber_dir.name, job_dir.name) in self._active_jobs
+                        or self._execution_alive(subscriber_dir.name, job_dir.name)):
                     continue
                 local_outcome = self._local_outcome_path(subscriber_dir.name, job_dir.name)
                 if local_outcome.is_file() and not (job_dir / "proxy_result.json").is_file():
-                    _write_json_atomic(job_dir / "proxy_result.json", json.loads(local_outcome.read_text(encoding="utf-8")))
+                    payload = json.loads(local_outcome.read_text(encoding="utf-8"))
+                    self._restore_outcome(job_dir, payload)
+                if not (job_dir / "proxy_result.json").is_file():
+                    self.recover_interrupted()
+                    return True
                 if (job_dir / "proxy_result.json").is_file():
                     self._move_to_answer(job_dir, subscriber_dir.name, job_dir.name)
                     self.logger(f"Published completed outcome {subscriber_dir.name}/{job_dir.name}")
@@ -431,6 +570,7 @@ class Proxy:
                 self._active_jobs.discard(identity)
 
     def _execute_file_job(self, selected: QueueJob) -> Path:
+        self.storage.require("queue")
         if isinstance(selected, tuple):
             return self._invalid(*selected)
         queued = selected
@@ -465,14 +605,21 @@ class Proxy:
         try:
             if transition_error:
                 raise BackendUnavailable(transition_error)
+            import sys
+            execution_path = self._execution_path(manifest.subscriber_id, manifest.job_id)
+            execution_path.parent.mkdir(parents=True, exist_ok=True)
+            from .worker_host import process_identity
+            _write_json_atomic(execution_path, {"version": 1, "phase": "RESERVED", "proxy": process_identity(os.getpid()),
+                                               "backend": self._file_job_backend(selected)})
             completed = subprocess.run(
-                [*registration.command, "--job-dir", str(running)],
+                [sys.executable, str(Path(__file__).with_name("worker_host.py")), "--journal", str(execution_path),
+                 "--timeout", str(registration.timeout_seconds), "--", *registration.command, "--job-dir", str(running)],
                 shell=False,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=registration.timeout_seconds,
+                timeout=registration.timeout_seconds + 30,
                 check=False,
                 cwd=registration.working_directory,
                 env={
@@ -482,6 +629,8 @@ class Proxy:
                     "AI_PROXY_CURRENT_RESOURCE_KEY": manifest.resource_key or "",
                     "AI_PROXY_NEXT_JOB_PRESENT": "1" if next_job_present else "0",
                     "AI_PROXY_NEXT_RESOURCE_KEY": next_resource_key,
+                    "AI_PROXY_EXECUTION_STATE": str(execution_path),
+                    "AI_PROXY_RUNTIME_DIR": str(self.local_runtime_dir),
                 },
             )
             exit_code = completed.returncode
@@ -505,23 +654,7 @@ class Proxy:
             status = "FAILED"
             error_type = "WORKER_LAUNCH"
             error_message = str(exc)
-        if not running.is_dir():
-            running.mkdir(parents=True, exist_ok=True)
-            _write_json_atomic(
-                running / "job.json",
-                {
-                    "protocol_version": manifest.protocol_version,
-                    "job_id": manifest.job_id,
-                    "subscriber_id": manifest.subscriber_id,
-                    "worker": manifest.worker,
-                    "created_at": iso_utc(manifest.created_at),
-                    "resource_key": manifest.resource_key,
-                },
-            )
-            status = "FAILED"
-            error_type = "INVALID_OUTPUT_STATE"
-            error_message = "Worker removed its job folder."
-        else:
+        if running.is_dir():
             try:
                 validate_job_folder(running, manifest.subscriber_id, manifest.job_id)
             except (InvalidJob, JobNotReady) as exc:
@@ -530,7 +663,8 @@ class Proxy:
                 error_message = str(exc)
         completed_at = utc_now()
         self._preserve_unsettled_backend(running)
-        output_files = _inventory_with_retry(running)
+        # Persist execution outcome before touching a potentially disconnected queue.
+        # A failed publication must not turn a successful execution into a rerun.
         result = ProxyResult(
             protocol_version=1,
             job_id=manifest.job_id,
@@ -545,10 +679,26 @@ class Proxy:
             error_message=error_message,
             stdout=stdout,
             stderr=stderr,
-            output_files=output_files,
+            output_files=None,
         )
-        self._persist_local_outcome(manifest.subscriber_id, manifest.job_id, result.to_dict())
-        _write_json_atomic(running / "proxy_result.json", result.to_dict())
+        payload = result.to_dict()
+        worker_result = self._execution_path(manifest.subscriber_id, manifest.job_id).with_suffix(".result.json")
+        if worker_result.is_file():
+            native = json.loads(worker_result.read_text(encoding="utf-8"))
+            if native.get("retryable"):
+                payload.update(recovery_class=native["recovery_class"], retryable=True)
+            if native.get("status") == "SUCCESS" and (error_type == "WORKER_EXIT" or not self.storage.poll(force=True)["available"]):
+                payload.update(status="SUCCEEDED", error_type=None, error_message="", exit_code=0)
+        if (payload["status"] == "FAILED" and error_type in {"WORKER_LAUNCH", "INVALID_OUTPUT_STATE", "WORKER_EXIT"}
+                and not worker_result.is_file() and not self.storage.poll(force=True)["available"]):
+            payload.update(recovery_class="STORAGE_UNAVAILABLE", retryable=True)
+        self._persist_local_outcome(manifest.subscriber_id, manifest.job_id, payload)
+        self.storage.require("queue")
+        if not running.is_dir():
+            raise StorageUnavailable(f"Execution folder is unavailable: {running}")
+        payload["output_files"] = _inventory_with_retry(running)
+        self._persist_local_outcome(manifest.subscriber_id, manifest.job_id, payload)
+        _write_json_atomic(running / "proxy_result.json", payload)
         answer = self._move_to_answer(running, manifest.subscriber_id, manifest.job_id)
         self.logger(
             f"Finished {manifest.subscriber_id}/{manifest.job_id}: "
@@ -557,6 +707,9 @@ class Proxy:
         return answer
 
     def process_once(self) -> Path | None:
+        self._clear_unsubmitted_guard()
+        if self._orphan_count():
+            return None
         if (self.local_runtime_dir / "unsettled_comfyui.json").exists():
             return None
         selected = self._select_file_job()
@@ -565,6 +718,15 @@ class Proxy:
         return self._process_file_job(selected)
 
     def _preserve_unsettled_backend(self, folder: Path) -> None:
+        guard = self.local_runtime_dir / "unsettled_comfyui.json"
+        local = self._execution_path(folder.parent.name, folder.name).with_suffix(".submission.json")
+        if local.is_file():
+            submission = json.loads(local.read_text(encoding="utf-8"))
+            if submission.get("settled") is not True and not guard.is_file():
+                _write_json_atomic(guard, submission)
+            return
+        if guard.is_file():
+            return
         path = folder / "comfyui_submission.json"
         if path.is_file():
             try:
@@ -576,6 +738,24 @@ class Proxy:
             except (OSError, ValueError) as exc:
                 self.logger(f"Unable to reconcile saved ComfyUI submission: {exc}")
 
+    def _clear_unsubmitted_guard(self):
+        guard = self.local_runtime_dir / "unsettled_comfyui.json"
+        if guard.is_file() and json.loads(guard.read_text(encoding="utf-8")).get("phase") == "PREPARED":
+            guard.replace(guard.with_name(f"unsettled_comfyui.unsubmitted-{time.time_ns()}.json"))
+            return True
+        return False
+
+    async def _reconcile_unsettled_comfyui(self, backend_manager: BackendManager) -> None:
+        """End ambiguous managed work before allowing another local attempt."""
+        # This stops only our owned process and refuses a reachable external one.
+        # A failed/interrupted file attempt already has its terminal outcome;
+        # recovery releases admission, never replays or rewrites that attempt.
+        await backend_manager.stop_comfyui()
+        guard = self.local_runtime_dir / "unsettled_comfyui.json"
+        archive = guard.with_name(f"unsettled_comfyui.recovered-{time.time_ns()}.json")
+        guard.replace(archive)
+        self.logger(f"Recovered unresolved ComfyUI submission after verified backend stop; saved {archive.name}. Local execution resumes.")
+
     @contextmanager
     def cloud_dispatch(self, poll_seconds: float = 1.0):
         """Independent trusted Codex lane; stopping waits for admitted workers."""
@@ -585,12 +765,14 @@ class Proxy:
                 pending = {}
                 last_blocked = None
                 while not stop.is_set():
-                    blocked = (self.local_runtime_dir / "unsettled_comfyui.json").exists()
+                    unsettled = (self.local_runtime_dir / "unsettled_comfyui.json").exists()
+                    blocked = unsettled or bool(self._orphan_count())
                     if blocked != last_blocked:
                         try:
                             _write_json_atomic(self.control_root / "execution_status.json", {
                                 "local_execution_blocked": blocked,
-                                "reason": "ComfyUI submission is unresolved; reconcile the proxy's saved prompt before local execution resumes." if blocked else "",
+                                "reason": ("ComfyUI submission is unresolved; reconcile the proxy's saved prompt before local execution resumes." if unsettled else
+                                           "A surviving worker still owns local execution; waiting for it to finish." if blocked else ""),
                                 "cloud_concurrency": self.cloud_concurrency})
                             last_blocked = blocked
                         except OSError as exc:
@@ -603,10 +785,13 @@ class Proxy:
                                 self.logger(f"Cloud worker {identity}: {exc}")
                             del pending[identity]
                     try:
+                        if not self._queue_ready():
+                            stop.wait(max(0.01, poll_seconds))
+                            continue
                         jobs, _ = self._scan()
                         for job in jobs:
                             identity = (job.manifest.subscriber_id, job.manifest.job_id)
-                            if len(pending) >= self.cloud_concurrency:
+                            if len(pending) + self._orphan_count(cloud=True) >= self.cloud_concurrency:
                                 break
                             if self._file_job_backend(job) != "codex" or identity in pending:
                                 continue
@@ -669,9 +854,23 @@ class Proxy:
     ) -> None:
         last_http_completed: float | None = None
         deferred_selected: QueueJob | tuple[Path, str, str, str] | None = None
+        last_recovery_error: str | None = None
         loop = asyncio.get_running_loop()
         while True:
+            self._clear_unsubmitted_guard()
             if (self.local_runtime_dir / "unsettled_comfyui.json").exists():
+                if backend_manager and backend_manager.config.enabled:
+                    try:
+                        await self._reconcile_unsettled_comfyui(backend_manager)
+                        last_recovery_error = None
+                        continue
+                    except (BackendUnavailable, OSError) as exc:
+                        if str(exc) != last_recovery_error:
+                            self.logger(f"ComfyUI recovery is held: {exc}")
+                            last_recovery_error = str(exc)
+                await asyncio.sleep(max(0.01, poll_seconds))
+                continue
+            if self._orphan_count():
                 await asyncio.sleep(max(0.01, poll_seconds))
                 continue
             selected = deferred_selected
@@ -767,18 +966,20 @@ class Proxy:
                     await backend_manager.released(file_backend)
 
     def run(self, poll_seconds: float = 1.0) -> None:
-        self.ensure_layout()
         self.logger(f"Queue root: {self.root}")
         with self.lock():
             self.logger(f"Lock acquired: {self.local_runtime_dir / 'proxy.lock'}")
-            recovered = self.recover_interrupted()
-            if recovered:
-                self.logger(f"Recovered {recovered} interrupted job(s)")
+            self._queue_ready()
             with self.cloud_dispatch(poll_seconds):
                 self.logger(f"Ready; polling every {poll_seconds:g}s. Press Ctrl-C to stop.")
                 idle = False
                 while True:
-                    if self.process_once() is None:
+                    try:
+                        outcome = self.process_once()
+                    except OSError:
+                        self._storage_reconciled = False
+                        outcome = None
+                    if outcome is None:
                         if not idle:
                             self.logger("Queue is idle")
                             idle = True
@@ -795,9 +996,18 @@ class Proxy:
 
     def status(self, subscriber: str | None = None, job: str | None = None) -> dict[str, Any]:
         try:
+            return self._available_status(subscriber, job)
+        except OSError as exc:
+            self.storage.poll(force=True)
+            return {"counts": None, "jobs": [dict(row, status="PAUSED_STORAGE") for row in self._status_cache],
+                    "degraded": str(exc), "storage": self.storage.status()}
+
+    def _available_status(self, subscriber: str | None = None, job: str | None = None) -> dict[str, Any]:
+        try:
             self.ensure_layout()
         except OSError as exc:
-            return {"counts": {}, "jobs": [], "degraded": str(exc)}
+            return {"counts": None, "jobs": [dict(row, status="PAUSED_STORAGE") for row in self._status_cache],
+                    "degraded": str(exc), "storage": self.storage.status()}
         counts = {"queued": 0, "running": 0, "succeeded": 0, "failed": 0, "invalid": 0}
         items: list[dict[str, Any]] = []
         for state, root in (("queued", self.ask_root), ("running", self.running_root), ("answer", self.answer_root)):
@@ -842,6 +1052,8 @@ class Proxy:
                             item_state = "failed"
                     counts[item_state] += 1
                     items.append(item)
-        blocked = (self.local_runtime_dir / "unsettled_comfyui.json").exists()
+        blocked = (self.local_runtime_dir / "unsettled_comfyui.json").exists() or bool(self._orphan_count())
+        self._status_cache = items
         return {"counts": counts, "jobs": items, "degraded": self._filesystem_degraded,
+                "storage": self.storage.status(),
                 "local_execution_blocked": blocked, "cloud_concurrency": self.cloud_concurrency}

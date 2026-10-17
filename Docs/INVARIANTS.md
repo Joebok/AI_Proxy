@@ -48,5 +48,11 @@ Trusted worker registration, never payload content, determines cloud admission.
 Codex work must not prepare/release local backends or update local affinity. Local
 operations retain one non-preemptive slot; cloud capacity defaults to two. Recovery
 runs before admission and never replays interrupted attempts. Unresolved native
-ComfyUI submissions durably block local execution, not cloud execution. Native
+ComfyUI submissions durably block local execution, not cloud execution. Managed
+recovery may archive the guard only after stopping its owned backend and verifying
+the endpoint is gone; external ambiguity remains blocked. Terminal attempts are
+never replayed or rewritten by guard recovery. Native
 provider code imports no subscriber application and does not rewrite task prompts.
+
+## Queue availability and witnesses
+Unavailable storage is not an invalid job or authorization to recreate a vanished envelope. Reconnect recovery first respects live worker witnesses and known outcomes. Reserved launches are fenced locally before abandoned execution is classified. Retryable interruption/storage outcomes allow a subscriber to create a new attempt; they never authorize proxy replay. An unsubmitted native PREPARED guard is distinct from ambiguous dispatch and can be cleared without backend shutdown. See [ADR 0006](DECISIONS/0006-storage-outage-recovery.md).

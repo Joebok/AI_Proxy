@@ -116,6 +116,7 @@ coordinate different runtime directories or machines.
 | HTTP 413 / 503 / 504 | Per-body limit / shared admission or backend block / queue-wait or upstream deadline; inspect request ID/status and body-free diagnostics. |
 | Backend shown unreachable | `/api/ps` and ComfyUI `/queue`; listener readiness does not prove backend readiness. `/system_stats` is not a render-success check. |
 | Managed prompt unresolved | Durable lifecycle record, keyed history and cancellation branch; owned backend may be stopped, external ambiguous work retains slot. No replay. |
+| Native ComfyUI jobs held across restart | Inspect local `unsettled_comfyui.json`. Managed scheduler now stops/verifies its owned backend, archives the guard and resumes automatically; the failed/interrupted attempt stays terminal. External ownership or stop/archive failures retain the hold. See [recovery decision](DECISIONS/0005-managed-native-comfyui-recovery.md). |
 | Dashboard error/restart | Supervisor logs/listener bind state; `S` stops, `R` restarts, `End` follows logs, `Q`/Ctrl+C exits. Active file workers finish before safe stop. |
 | Policy does not reload | Optional path, JSON validation/status error, last-known-good state, timestamp change detection; inspect observed failing test. |
 
@@ -174,3 +175,35 @@ passed: 6 passed, 1 live scenario deselected (9.10s). Python AST, registration J
 and `git diff --check` passed. No runtime restart, failed-job replay or production
 backend call was performed. Restart the proxy to load registrations and explicitly
 retry affected workflow jobs; their original failed receipts remain history.
+
+
+## Native ComfyUI guard recovery (2026-10-16)
+
+A stale local submission guard blocked E:\Zet\AI_Queue after a drive outage.
+Read-only live status confirmed no running file worker, no managed process and
+an unreachable ComfyUI endpoint. The guard was renamed locally to
+`unsettled_comfyui.recovered-20261016.json`; the existing proxy resumed, started
+ComfyUI and processed a render whose keyed history reported completed success.
+The next image job started. No failed attempt was replayed or envelope edited.
+
+The managed scheduler now automatically stops/verifies its owned backend before
+archiving a native guard and resuming admission. Existing isolated checks passed:
+`.\.venv\Scripts\python.exe -m pytest -q`: **6 passed, 1 live scenario deselected
+(8.46s)**. The new native guard branch is not directly covered by those scenarios;
+no test scenario was added or expanded. The active process was left running;
+code recovery takes effect on the next full proxy application launch.
+
+## Storage recovery verification (2026-10-17)
+The six approved isolated scenarios passed with `.venv/Scripts/python.exe -m pytest -q`
+(one live scenario deselected). Python compilation and `git diff --check` passed.
+No maintained scenario was added or expanded. Controlled private-worker checks
+also verified parent-proxy death, surviving local slot ownership with independent
+cloud execution, queue disappearance/reconnect, and publication of successful
+orphan execution without replay. Windows process handles retained by a launcher
+no longer make an exited proxy appear alive.
+
+Native submission identity/phase and outcomes are local before shared writes;
+metadata excludes the workflow graph. One background probe worker per monitor
+bounds status wait time and leaves unrelated verified resources usable during a
+stalled device call. Physical drive disconnects, live providers and production
+restart/deployment were not exercised. See [ADR 0006](DECISIONS/0006-storage-outage-recovery.md).

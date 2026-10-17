@@ -215,7 +215,7 @@ class ProxyDashboard(App[None]):
             listener_lines = ["[bold]PROXY LISTENERS[/bold]", "File proxy mode", "No HTTP ports configured"]
         self.query_one("#listeners", Static).update("\n".join(listener_lines))
 
-        count = snapshot.filesystem_counts
+        count = {key: "?" if value is None else value for key, value in snapshot.filesystem_counts.items()}
         queue_lines = [
             "[bold]QUEUES[/bold]",
             f"Filesystem  queued [bold]{count['queued']}[/bold]  running [bold]{count['running']}[/bold]",

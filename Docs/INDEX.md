@@ -60,3 +60,8 @@ entry here. Keep code references relative and symbol-based, avoiding line number
 [Native AI providers](COMPONENTS/AI_PROVIDERS.md) owns the versioned request/result
 payload, independent Codex lane, catalog/cache interface and legacy registration
 policy. [ADR 0004](DECISIONS/0004-native-ai-and-cloud-lane.md) records the boundary.
+[ADR 0005](DECISIONS/0005-managed-native-comfyui-recovery.md) records automatic
+native submission guard recovery through verified managed backend stop.
+
+## Storage recovery (2026-10-17)
+[ADR 0006](DECISIONS/0006-storage-outage-recovery.md) records fixed-local witnesses, reconnect reconciliation, native submission evidence, and subscriber-owned fresh attempts. File transport and native provider components retain interface ownership.

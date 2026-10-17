@@ -144,3 +144,9 @@ list of bare Codex model names. `Control/model_catalog.json` is an atomic shared
 metadata snapshot; `Control/refresh-models.json` coalesces metadata refresh requests.
 Local `unsettled_comfyui.json` fences ambiguous GPU execution across restart. See
 [native providers](COMPONENTS/AI_PROVIDERS.md) for interface ownership.
+Managed recovery renames that guard to
+`unsettled_comfyui.recovered-<timestamp>.json` only after verified backend stop;
+these local diagnostic archives do not affect admission or alter job receipts.
+
+## Local storage recovery evidence
+Queue-keyed `storage-health-<key>.json` records root identity and availability. `executions/<subscriber>/<job>.json` records launch/process identity and exit state, with native `.result.json` and metadata-only `.submission.json` sidecars. ComfyUI guards retain submission phase/identity outside the queue. Protocol-v1 outcomes optionally add `recovery_class` and `retryable`; published terminal outcomes stay immutable. See [ADR 0006](DECISIONS/0006-storage-outage-recovery.md).
