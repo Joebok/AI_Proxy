@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from .models import iso_utc, utc_now
-from .validation import validate_relative_reference
+from .validation import is_link_like, validate_relative_reference
 
 
 class ProviderError(RuntimeError):
@@ -42,9 +42,16 @@ def save_submission(root, submission):
         guard = Path(local) / "unsettled_comfyui.json"
         if not submission["settled"]:
             write_json(guard, metadata)
+        elif is_link_like(guard):
+            # Leave link-like guard evidence for the proxy to fail closed on.
+            pass
         elif guard.is_file():
-            saved = json.loads(guard.read_text(encoding="utf-8"))
-            if saved.get("job_id") == root.name:
+            try:
+                saved = json.loads(guard.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                # Preserve unreadable safety evidence for proxy-side recovery.
+                saved = None
+            if isinstance(saved, dict) and saved.get("job_id") == root.name:
                 guard.unlink()
     write_json(root / "comfyui_submission.json", submission)
 

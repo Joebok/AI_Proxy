@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Any, Callable
@@ -52,7 +52,7 @@ class ReasoningPolicyStore:
             return
         self._aliases = aliases
         self._mtime_ns = stat.st_mtime_ns
-        self._loaded_at = datetime.now(UTC).isoformat()
+        self._loaded_at = datetime.now(timezone.utc).isoformat()
         self._generated_at = generated_at
         self._last_error = None
         self._has_loaded = True

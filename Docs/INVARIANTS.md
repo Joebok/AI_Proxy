@@ -11,10 +11,10 @@ every possible case has coverage; see [DEVELOPMENT.md](DEVELOPMENT.md) for resul
 | --- | --- | --- |
 | Published asks are immutable; workers preserve `job.json` and declared inputs. This prevents partial-input execution and identity drift. Application owns publication; proxy owns queue moves. | [validation.py](../file_proxy/validation.py): `validate_job_folder`; [engine.py](../file_proxy/engine.py): `_process_file_job` validates again after worker. Affects publishers/workers/harvesters. Immutability itself is an integration contract, not OS write protection. | [File task scenario](../tests/test_e2e.py) checks inventory and unsafe output handling; publisher immutability itself is not enforced by the proxy. |
 | Inventoried bytes must match before execution. Missing/mismatched manifest or declared files wait within sync grace; invalid contracts become terminal answers. This accommodates eventual sync. | `validate_file_inventory`, `Proxy._scan`; affects sync timing and error classification. Malformed non-manifest payload JSON is invalid, not deferred. | [File task scenario](../tests/test_e2e.py) verifies delayed input completion, inventory publication and unsafe worker output. Grace expiry is not covered. |
-| Identity must match directory and paths must remain inside the envelope under Windows/POSIX checks. API route strings have explicit exemptions. This keeps queue references portable and contained. | `models` validators; `validate_relative_reference`, `_path_values`; affects schemas, worker JSON, symlinks. It is not a general sandbox for trusted worker code. | File task scenario checks unsafe worker-output handling. Symlink escape and API-route exemptions are not separate scenarios. |
+| Identity must match directory and paths must remain inside the envelope under Windows/POSIX checks. Link-like roots and nested reparse points are rejected before inventory. API route strings have explicit exemptions. This keeps queue references portable and contained. | `models` validators; `validate_relative_reference`, `_path_values`, `validation.is_link_like`; affects schemas, worker JSON, symlinks and Windows junctions. It is not a general sandbox for trusted worker code. | File task scenario checks unsafe worker-output handling. Reparse-point and API-route exemptions are not separate scenarios. |
 | Execute only registered local argv, append `--job-dir`, use `shell=False`. Queue writers do not choose executable code. | `Registry.load`, `WorkerRegistration`, `Proxy._process_file_job`; affects all subscriber commands and cwd/environment. | File task scenario launches a registered temporary subprocess. Registry expansion and launch-failure branches are not separate scenarios. |
 | Single attempt, no automatic worker replay. An interrupted unknown outcome becomes `PROXY_INTERRUPTED`; known journal/result is republished. Avoid duplicate external effects. | `recover_interrupted`, `_publish_completed_running`, `_persist_local_outcome`; affects restart, publication failure, subscriber retries. | Dashboard scenario verifies interrupted recovery without replay. Worker launch/timeout and journal-publication failure branches are not separate scenarios. |
-| Answer results and full inventory must be durably harvested before subscriber retention; retry uses a fresh attempt ID. This is subscriber-owned, not an implemented harvester. | [README contract](../README.md), `ProxyResult`, `_move_to_answer` rejects existing answer. Affects subscriber idempotency and retention. | Integrating app tests must cover duplicate harvest, partial answers, new-ID retry; no subscriber tests here. |
+| Answer results and full inventory must be durably harvested before subscriber retention; retry uses a fresh attempt ID. This is subscriber-owned, not an implemented harvester. | [README contract](../README.md), `ProxyResult`, `_move_to_answer` preserves an existing answer and leaves a collision blocked for operator action. Affects subscriber idempotency and retention. | Integrating app tests must cover duplicate harvest, partial answers, new-ID retry; no subscriber tests here. |
 
 ## Scheduling and process safety
 
@@ -48,9 +48,10 @@ Trusted worker registration, never payload content, determines cloud admission.
 Codex work must not prepare/release local backends or update local affinity. Local
 operations retain one non-preemptive slot; cloud capacity defaults to two. Recovery
 runs before admission and never replays interrupted attempts. Unresolved native
-ComfyUI submissions durably block local execution, not cloud execution. Managed
-recovery may archive the guard only after stopping its owned backend and verifying
-the endpoint is gone; external ambiguity remains blocked. Terminal attempts are
+ComfyUI submissions durably block local execution, not cloud execution. An
+unreadable guard also blocks local execution and requires operator recovery.
+Managed recovery may archive a known ambiguous guard only after stopping its
+owned backend and verifying the endpoint is gone; external ambiguity remains blocked. Terminal attempts are
 never replayed or rewritten by guard recovery. Native
 provider code imports no subscriber application and does not rewrite task prompts.
 

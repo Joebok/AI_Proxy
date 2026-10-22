@@ -624,7 +624,7 @@ For a new Windows deployment:
 4. Set any machine-specific subscriber variables described by its registry.
    For the included Zet registry, `ZET_PROJECT_ROOT` defaults to a sibling
    `Zet` checkout. Set `AI_QUEUE_ROOT` if the queue is not at
-   `%USERPROFILE%\Dropbox\AI_Queue`.
+   `E:\Zet\AI_Queue`.
 5. Start the proxy with `run_file_proxy.ps1` or `run_file_proxy.bat`. Both
    launch the terminal dashboard through `.venv\Scripts\python.exe` directly;
    activation is not required.

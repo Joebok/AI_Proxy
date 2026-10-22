@@ -41,8 +41,10 @@ and execution internals. `process_once` assumes its caller owns runtime coordina
    is recreated with minimal identity metadata and failed; otherwise envelope
    validation runs again, detecting mutated inventoried inputs and unsafe JSON.
 7. Build full non-hidden inventory; persist normal-worker outcome locally;
-   atomically write transport result; rename to Answer; remove local journal.
-   Answer collision raises rather than overwriting prior results.
+   atomically write transport result; rename to Answer; remove local outcome
+   journal. An Answer collision leaves the current envelope in place, is reported
+   as blocked, and does not overwrite the prior Answer or replay the worker.
+   Invalid-job publication follows the same collision handling.
 8. Subscriber validates full result inventory, copies artifacts durably, applies
    business updates idempotently, then owns retention. Queue listings alone are
    not an authoritative business state machine.
@@ -63,7 +65,10 @@ mode is not equally resilient to every moving/locked path; do not assume all sca
 status, collision, or malformed recovery errors are caught. See development gaps.
 
 Registry commands are trusted code and are not sandboxed. Recursive path checks
-cover recognized JSON references and escaping symlinks, not arbitrary worker I/O.
+cover recognized JSON references; symbolic links and Windows reparse points are
+removed from invalid envelopes before a regular `INVALID` answer is published,
+without traversing or changing their targets.
+This is not a general sandbox for arbitrary worker I/O.
 Worker contract: leave manifest/inputs intact, keep outputs inside envelope,
 close complete outputs before exit 0, write useful bounded diagnostics, do not
 poll/retry/move jobs. Captured logs are not truncated by the proxy.

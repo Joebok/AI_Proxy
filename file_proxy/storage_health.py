@@ -42,15 +42,26 @@ class StorageHealth:
         self._probing_name = None
         self._probe_timed_out = False
         self._rows = {}
+        self._journal_error = None
         try:
-            self._rows = json.loads(self.journal.read_text(encoding="utf-8")).get("resources", {})
+            value = json.loads(self.journal.read_text(encoding="utf-8"))
+            if (not isinstance(value, dict) or not isinstance(value.get("resources", {}), dict)
+                    or any(not isinstance(row, dict) for row in value.get("resources", {}).values())):
+                raise ValueError("storage health journal must contain a resources object")
+            self._rows = value.get("resources", {})
         except FileNotFoundError:
             pass
+        except (OSError, UnicodeError, ValueError) as exc:
+            self._journal_error = f"Storage health journal is unreadable: {self.journal}: {exc}"
+            self._rows = {name: {"path": str(path), "status": "RECOVERY_REQUIRED", "error": self._journal_error}
+                          for name, path in self.resources.items()}
         for name, row in self._rows.items():
             if name.startswith("catalog:") and Path(row["path"]).parent == self.resources.get("library"):
                 self.resources[name] = Path(row["path"])
 
     def _save(self):
+        if self._journal_error:
+            raise StorageUnavailable(self._journal_error)
         self.journal.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.journal.with_name("." + self.journal.name + "." + uuid4().hex)
         try:
@@ -63,6 +74,8 @@ class StorageHealth:
             temporary.unlink(missing_ok=True)
 
     def poll(self, *, force=False):
+        if self._journal_error:
+            return self.status()
         # A stalled Windows device call must not hold the status lock or spawn
         # another probe thread on every dashboard request.
         with self._lock:
@@ -215,6 +228,8 @@ class StorageHealth:
 
     def require(self, *names):
         self.poll()
+        if self._journal_error:
+            raise StorageUnavailable(self._journal_error)
         with self._lock:
             requested = [(name, self.resources[name], dict(self._rows.get(name, {})))
                          for name in names or self.resources]

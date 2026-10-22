@@ -28,8 +28,10 @@ precedence over a recognized resource prefix. Ordering is owned by
 
 Path handling is defined by `validate_relative_reference` and `_path_values`:
 reject blank/absolute/traversal/escaping references under both Windows and POSIX
-rules. JSON keys `path`, `_path`, `_file`, `_files`, `_dir` are recognized
-recursively, except `api_path`, `endpoint_path`, `url_path`. Use POSIX-style
+rules. Symbolic links and Windows reparse points are rejected at job roots and
+inside inventoried envelopes before file contents are read. JSON keys `path`,
+`_path`, `_file`, `_files`, `_dir` are recognized recursively, except `api_path`,
+`endpoint_path`, `url_path`. Use POSIX-style
 relative values for portability. Not every arbitrary string is validated as a
 path; this is a scoped reference convention, not a full filesystem sandbox.
 
@@ -42,7 +44,8 @@ must inventory material inputs themselves. See [README](../README.md) examples.
 File terminal statuses are uppercase `SUCCEEDED`, `FAILED`, `INVALID`; HTTP
 states below are a separate contract. Preserve unknown future error types.
 Current engine error types include `INVALID_JOB`, `WORKER_EXIT`, `WORKER_TIMEOUT`,
-`WORKER_LAUNCH`, `INVALID_OUTPUT_STATE`, `PROXY_INTERRUPTED`, `RESOURCE_TRANSITION`.
+`WORKER_LAUNCH`, `INVALID_OUTPUT_STATE`, `PROXY_INTERRUPTED`,
+`RECOVERY_STATE_CORRUPT`, `RESOURCE_TRANSITION`.
 
 ## Trusted worker registry
 
@@ -101,7 +104,8 @@ to CLI options; see [DEVELOPMENT.md](DEVELOPMENT.md).
 | Runtime path | Definition / owner |
 | --- | --- |
 | `proxy.lock` | `RuntimeLock`: exclusive-create JSON with PID, hostname, start time. Released on normal exit. Foreign-host owners are not reclaimed. This is local process coordination, not a queue-wide distributed lock. |
-| `worker-outcomes/<subscriber>/<job>.json` | Engine journals normal worker outcomes before writing the transport result; removed after successful Answer move. Recovery can republish without rerunning a completed worker. Invalid/interrupted outcomes do not use this normal-worker journal path. |
+| `worker-outcomes/<subscriber>/<job>.json` | Engine journals normal worker outcomes before writing the transport result; removed after successful Answer move and before a fresh attempt reuses the same local identity. Recovery can republish without rerunning a completed worker. |
+| `executions/<subscriber>/<job>.json` and sidecars | Engine and worker host retain launch witnesses plus native result/submission evidence while an envelope may need recovery. They are removed after successful Answer publication. Fresh attempts clear stale sidecars before launch; corrupt witnesses remain locally blocked when process termination cannot be proven. |
 | `executions.sqlite3` | `ExecutionStore.__init__` creates `executions` and `artifacts`; no versioned schema migrations are implemented. Request bodies are not stored. |
 | `cache/<prompt_id>/<hash>-<filename>` | Archived standard ComfyUI artifacts fetched via `/view`; `.partial` write becomes final by replace. Mapping is stored in artifacts table. |
 | `comfyui.log` / backups | Backend process stdout/stderr, size-bounded rotation; not the same privacy contract as HTTP request diagnostics. |
@@ -149,4 +153,4 @@ Managed recovery renames that guard to
 these local diagnostic archives do not affect admission or alter job receipts.
 
 ## Local storage recovery evidence
-Queue-keyed `storage-health-<key>.json` records root identity and availability. `executions/<subscriber>/<job>.json` records launch/process identity and exit state, with native `.result.json` and metadata-only `.submission.json` sidecars. ComfyUI guards retain submission phase/identity outside the queue. Protocol-v1 outcomes optionally add `recovery_class` and `retryable`; published terminal outcomes stay immutable. See [ADR 0006](DECISIONS/0006-storage-outage-recovery.md).
+Queue-keyed `storage-health-<key>.json` records root identity and availability. A corrupt health journal reports `RECOVERY_REQUIRED` and blocks queue admission rather than failing proxy construction. `executions/<subscriber>/<job>.json` records launch/process identity and exit state, with native `.result.json` and metadata-only `.submission.json` sidecars. ComfyUI guards retain submission phase/identity outside the queue; unreadable guard state blocks local execution and is never cleared automatically. Protocol-v1 outcomes optionally add `recovery_class` and `retryable`; published terminal outcomes stay immutable. See [ADR 0006](DECISIONS/0006-storage-outage-recovery.md).

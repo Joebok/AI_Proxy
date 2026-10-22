@@ -27,6 +27,9 @@ uses ordinary HTTP. Progress clients should use raw ComfyUI `/ws`.
 inference admission. Queued routes reserve request capacity, read chunks with a
 per-request limit and shared buffered-byte accounting, optionally normalize the
 Ollama effort field, then enqueue. Queue/history POST mutations set a barrier.
+Every failed post-read normalization and pre-dispatch cancellation releases its
+request and original-body byte reservation exactly once; unencodable normalized
+JSON receives HTTP 400.
 Queue wait expires independently of upstream execution timeout. Failures:
 413 per-body overflow; 503 admission/shutdown/backend errors (capacity/backend
 errors add Retry-After); 504 queue wait/upstream timeout; 502 upstream transport.
@@ -59,6 +62,9 @@ when absent or validates supplied ID, and creates durable unique tracking before
 dispatch. A valid returned different upstream ID replaces the tracked ID unless
 already retained. It reads bounded upstream response, decodes gzip/deflate where
 needed, recalculates response headers, and delivers submission response immediately.
+If the upstream returns an ID retained by another execution, the new record stays
+blocked, the proxy reports HTTP 409, and the slot remains held until shutdown; it
+never archives history or artifacts under the other execution's identity.
 
 The slot remains held after response delivery. One monotonic settlement deadline
 starts before upstream dispatch; `_wait_for_prompt_completion` polls native or
@@ -88,11 +94,11 @@ job status survive backend stop/restart while retained. See store methods before
 changing history clearing, lookup without prompt ID, or eviction.
 
 Runtime startup reconciles abandoned Ollama records by verified unload; it never
-replays requests. ComfyUI pending records are checked briefly for keyed history:
-archive when found, fail in managed mode if the previous owned backend ended,
-or block external ambiguity. Inspect `reconcile_records` and its chosen service
-upstream before changing listener combinations; behavior with missing listeners
-does not establish complete restart reconciliation for all configurations.
+replays requests. ComfyUI pending records are checked for keyed history only
+through a ComfyUI listener. When history is absent, managed recovery stops and
+verifies the owned backend before marking the attempt terminal; external or
+unavailable listeners retain a blocked outcome. No unrelated upstream is used
+for ComfyUI reconciliation.
 
 ## Extension and verification
 

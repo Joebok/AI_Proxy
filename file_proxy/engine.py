@@ -21,11 +21,15 @@ from .models import InvalidJob, JobManifest, JobNotReady, ProxyResult, QueueJob,
 from .registry import Registry
 from .scheduler import HttpQueue
 from .backend import BackendManager, BackendUnavailable
-from .validation import build_file_inventory, validate_job_folder
+from .validation import build_file_inventory, find_link_like, is_link_like, remove_link_like, validate_job_folder
 from .storage_health import StorageHealth, StorageUnavailable
 
 
 class ProxyAlreadyRunning(RuntimeError):
+    pass
+
+
+class AnswerCollision(RuntimeError):
     pass
 
 
@@ -238,8 +242,9 @@ class Proxy:
                 except FileNotFoundError:
                     self._orphan_paths.discard(path)
                 except (OSError, ValueError):
-                    if not cloud:
-                        count += 1
+                    # The unreadable witness does not identify its lane, so
+                    # reserve capacity conservatively in both local and cloud.
+                    count += 1
         return count
 
     def lock(self) -> RuntimeLock:
@@ -248,13 +253,27 @@ class Proxy:
     def _answer_path(self, subscriber_id: str, job_id: str) -> Path:
         return self.answer_root / subscriber_id / job_id
 
+    def _answer_occupied(self, subscriber_id: str, job_id: str) -> bool:
+        destination = self._answer_path(subscriber_id, job_id)
+        if is_link_like(destination.parent):
+            return True
+        return destination.exists() or is_link_like(destination)
+
     def _move_to_answer(self, path: Path, subscriber_id: str, job_id: str) -> Path:
         destination = self._answer_path(subscriber_id, job_id)
+        if is_link_like(self.answer_root) or is_link_like(destination.parent):
+            raise AnswerCollision(f"answer directory is a link or reparse point: {destination.parent}")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
-            raise RuntimeError(f"answer already exists: {destination}")
+        if is_link_like(self.answer_root) or is_link_like(destination.parent) or self._answer_occupied(subscriber_id, job_id):
+            raise AnswerCollision(f"answer already exists: {destination}")
         _replace_with_retry(path, destination)
-        self._local_outcome_path(subscriber_id, job_id).unlink(missing_ok=True)
+        execution = self._execution_path(subscriber_id, job_id)
+        for metadata in (execution, execution.with_suffix(".result.json"), execution.with_suffix(".submission.json"),
+                         self._local_outcome_path(subscriber_id, job_id)):
+            try:
+                metadata.unlink(missing_ok=True)
+            except OSError as exc:
+                self.logger(f"Unable to clean published execution metadata {metadata.name}: {exc}")
         return destination
 
     def _local_outcome_path(self, subscriber_id: str, job_id: str) -> Path:
@@ -284,7 +303,27 @@ class Proxy:
             payload["output_files"] = _inventory_with_retry(folder)
         _write_json_atomic(folder / "proxy_result.json", payload)
 
-    def _invalid(self, path: Path, subscriber_id: str, job_id: str, message: str) -> Path:
+    def _publish_corrupt_state(self, folder: Path, reason: str) -> bool:
+        result = ProxyResult(
+            protocol_version=1, job_id=folder.name, subscriber_id=folder.parent.name,
+            worker="", status="FAILED", started_at=iso_utc(utc_now()),
+            completed_at=iso_utc(utc_now()), duration_seconds=0.0, exit_code=None,
+            error_type="RECOVERY_STATE_CORRUPT", error_message=reason, output_files=[],
+        )
+        try:
+            result.output_files = _inventory_with_retry(folder)
+        except InvalidJob:
+            result.output_files = []
+        _write_json_atomic(folder / "proxy_result.json", result.to_dict())
+        try:
+            self._move_to_answer(folder, folder.parent.name, folder.name)
+        except AnswerCollision as exc:
+            self.logger(f"Answer collision for {folder.parent.name}/{folder.name}; leaving Running job for operator action: {exc}")
+            return False
+        self.logger(f"Published {folder.parent.name}/{folder.name} as failed because recovery state was corrupt")
+        return True
+
+    def _invalid(self, path: Path, subscriber_id: str, job_id: str, message: str) -> Path | None:
         self.logger(f"Invalid job {subscriber_id}/{job_id}: {message}")
         started = utc_now()
         result = ProxyResult(
@@ -299,24 +338,68 @@ class Proxy:
             exit_code=None,
             error_type="INVALID_JOB",
             error_message=message,
-            output_files=_inventory_with_retry(path),
+            output_files=[],
         )
-        if path.is_symlink():
-            path.unlink()
+        if is_link_like(path):
+            remove_link_like(path)
             path.mkdir()
+        else:
+            while True:
+                linked = find_link_like(path)
+                if linked is None:
+                    break
+                remove_link_like(linked)
+        try:
+            result.output_files = _inventory_with_retry(path)
+        except InvalidJob:
+            result.output_files = []
         _write_json_atomic(path / "proxy_result.json", result.to_dict())
-        return self._move_to_answer(path, subscriber_id, job_id)
+        try:
+            return self._move_to_answer(path, subscriber_id, job_id)
+        except AnswerCollision as exc:
+            self.logger(f"Answer collision for {subscriber_id}/{job_id}; leaving invalid job for operator action: {exc}")
+            return None
 
     def recover_interrupted(self) -> int:
         self.storage.require("queue")
         recovered = 0
         for subscriber_dir in sorted(path for path in self.running_root.iterdir() if path.is_dir()):
+            if is_link_like(subscriber_dir):
+                continue
             for job_dir in sorted(path for path in subscriber_dir.iterdir() if path.is_dir()):
-                if ((subscriber_dir.name, job_dir.name) in self._active_jobs
-                        or self._execution_alive(subscriber_dir.name, job_dir.name)):
+                linked = find_link_like(job_dir)
+                if linked is not None:
+                    answer = self._invalid(job_dir, subscriber_dir.name, job_dir.name,
+                                            "link or reparse point is not allowed in Running job")
+                    recovered += int(answer is not None)
+                    continue
+                if (subscriber_dir.name, job_dir.name) in self._active_jobs:
+                    continue
+                try:
+                    alive = self._execution_alive(subscriber_dir.name, job_dir.name)
+                except (OSError, UnicodeError, ValueError) as exc:
+                    self.logger(f"Recovery evidence for {subscriber_dir.name}/{job_dir.name} is unreadable; leaving it blocked: {exc}")
+                    continue
+                if alive:
                     continue
                 native_result = self._execution_path(subscriber_dir.name, job_dir.name).with_suffix(".result.json")
                 witness_path = self._execution_path(subscriber_dir.name, job_dir.name)
+                local_outcome = self._local_outcome_path(subscriber_dir.name, job_dir.name)
+                corrupt = None
+                for state_path in (native_result, witness_path, local_outcome, job_dir / "proxy_result.json"):
+                    if not state_path.is_file():
+                        continue
+                    try:
+                        state_value = json.loads(state_path.read_text(encoding="utf-8"))
+                        if not isinstance(state_value, dict):
+                            raise ValueError("expected a JSON object")
+                    except (OSError, UnicodeError, ValueError) as exc:
+                        corrupt = f"{state_path.name} is unreadable: {exc}"
+                        break
+                if corrupt:
+                    self._preserve_unsettled_backend(job_dir)
+                    recovered += int(self._publish_corrupt_state(job_dir, corrupt))
+                    continue
                 if witness_path.is_file() and not self._local_outcome_path(subscriber_dir.name, job_dir.name).is_file():
                     witness = json.loads(witness_path.read_text(encoding="utf-8"))
                     if witness.get("phase") == "EXITED":
@@ -352,12 +435,21 @@ class Proxy:
                             "completed_at": native["completed_at"], "duration_seconds": 0, "exit_code": 0,
                             "output_files": None})
                 self._preserve_unsettled_backend(job_dir)
-                local_outcome = self._local_outcome_path(subscriber_dir.name, job_dir.name)
                 if local_outcome.is_file() and not (job_dir / "proxy_result.json").is_file():
-                    payload = json.loads(local_outcome.read_text(encoding="utf-8"))
+                    try:
+                        payload = json.loads(local_outcome.read_text(encoding="utf-8"))
+                        if not isinstance(payload, dict):
+                            raise ValueError("worker outcome must be a JSON object")
+                    except (OSError, UnicodeError, ValueError) as exc:
+                        recovered += int(self._publish_corrupt_state(job_dir, f"{local_outcome.name} is unreadable: {exc}"))
+                        continue
                     self._restore_outcome(job_dir, payload)
                 if (job_dir / "proxy_result.json").is_file():
-                    self._move_to_answer(job_dir, subscriber_dir.name, job_dir.name)
+                    try:
+                        self._move_to_answer(job_dir, subscriber_dir.name, job_dir.name)
+                    except AnswerCollision as exc:
+                        self.logger(f"Answer collision for {subscriber_dir.name}/{job_dir.name}; leaving Running job for operator action: {exc}")
+                        continue
                     self.logger(f"Published previously completed job {subscriber_dir.name}/{job_dir.name}")
                     recovered += 1
                     continue
@@ -383,7 +475,11 @@ class Proxy:
                     output_files=_inventory_with_retry(job_dir),
                 )
                 _write_json_atomic(job_dir / "proxy_result.json", {**result.to_dict(), "recovery_class": "EXECUTION_INTERRUPTED", "retryable": True})
-                self._move_to_answer(job_dir, subscriber_dir.name, job_dir.name)
+                try:
+                    self._move_to_answer(job_dir, subscriber_dir.name, job_dir.name)
+                except AnswerCollision as exc:
+                    self.logger(f"Answer collision for {subscriber_dir.name}/{job_dir.name}; leaving Running job for operator action: {exc}")
+                    continue
                 self.logger(f"Recovered interrupted job {subscriber_dir.name}/{job_dir.name} as FAILED")
                 recovered += 1
         return recovered
@@ -395,10 +491,12 @@ class Proxy:
         for subscriber_dir in sorted(path for path in self.ask_root.iterdir() if path.is_dir()):
             if subscriber_dir.name.startswith("."):
                 continue
-            if subscriber_dir.is_symlink():
+            if is_link_like(subscriber_dir):
                 continue
             for job_dir in sorted(path for path in subscriber_dir.iterdir() if path.is_dir()):
                 if job_dir.name.startswith("."):
+                    continue
+                if self._answer_occupied(subscriber_dir.name, job_dir.name):
                     continue
                 try:
                     manifest = validate_job_folder(job_dir, subscriber_dir.name, job_dir.name)
@@ -459,19 +557,44 @@ class Proxy:
         if not self.running_root.is_dir():
             return False
         for subscriber_dir in sorted(path for path in self.running_root.iterdir() if path.is_dir()):
+            if is_link_like(subscriber_dir):
+                continue
             for job_dir in sorted(path for path in subscriber_dir.iterdir() if path.is_dir()):
-                if ((subscriber_dir.name, job_dir.name) in self._active_jobs
-                        or self._execution_alive(subscriber_dir.name, job_dir.name)):
+                linked = find_link_like(job_dir)
+                if linked is not None:
+                    answer = self._invalid(job_dir, subscriber_dir.name, job_dir.name,
+                                           "link or reparse point is not allowed in Running job")
+                    return answer is not None
+                if (subscriber_dir.name, job_dir.name) in self._active_jobs:
+                    continue
+                try:
+                    if self._execution_alive(subscriber_dir.name, job_dir.name):
+                        continue
+                except (OSError, UnicodeError, ValueError) as exc:
+                    self.logger(f"Recovery evidence for {subscriber_dir.name}/{job_dir.name} is unreadable; leaving it blocked: {exc}")
                     continue
                 local_outcome = self._local_outcome_path(subscriber_dir.name, job_dir.name)
                 if local_outcome.is_file() and not (job_dir / "proxy_result.json").is_file():
-                    payload = json.loads(local_outcome.read_text(encoding="utf-8"))
-                    self._restore_outcome(job_dir, payload)
+                    try:
+                        payload = json.loads(local_outcome.read_text(encoding="utf-8"))
+                        if not isinstance(payload, dict):
+                            raise ValueError("worker outcome must be a JSON object")
+                    except (OSError, UnicodeError, ValueError) as exc:
+                        self._preserve_unsettled_backend(job_dir)
+                        return self._publish_corrupt_state(job_dir, f"{local_outcome.name} is unreadable: {exc}")
+                    try:
+                        self._restore_outcome(job_dir, payload)
+                    except (OSError, UnicodeError, ValueError) as exc:
+                        self._preserve_unsettled_backend(job_dir)
+                        return self._publish_corrupt_state(job_dir, f"Recovery data is unreadable: {exc}")
                 if not (job_dir / "proxy_result.json").is_file():
-                    self.recover_interrupted()
-                    return True
+                    return self.recover_interrupted() > 0
                 if (job_dir / "proxy_result.json").is_file():
-                    self._move_to_answer(job_dir, subscriber_dir.name, job_dir.name)
+                    try:
+                        self._move_to_answer(job_dir, subscriber_dir.name, job_dir.name)
+                    except AnswerCollision as exc:
+                        self.logger(f"Answer collision for {subscriber_dir.name}/{job_dir.name}; leaving Running job for operator action: {exc}")
+                        return False
                     self.logger(f"Published completed outcome {subscriber_dir.name}/{job_dir.name}")
                     return True
         return False
@@ -557,9 +680,11 @@ class Proxy:
     def _process_file_job(
         self,
         selected: QueueJob | tuple[Path, str, str, str],
-    ) -> Path:
+    ) -> Path | None:
         if isinstance(selected, tuple):
             return self._invalid(*selected)
+        if self._file_job_backend(selected) != "codex" and self._local_admission_blocked():
+            return None
         identity = (selected.manifest.subscriber_id, selected.manifest.job_id)
         with self._scan_guard:
             self._active_jobs.add(identity)
@@ -569,7 +694,7 @@ class Proxy:
             with self._scan_guard:
                 self._active_jobs.discard(identity)
 
-    def _execute_file_job(self, selected: QueueJob) -> Path:
+    def _execute_file_job(self, selected: QueueJob) -> Path | None:
         self.storage.require("queue")
         if isinstance(selected, tuple):
             return self._invalid(*selected)
@@ -608,6 +733,9 @@ class Proxy:
             import sys
             execution_path = self._execution_path(manifest.subscriber_id, manifest.job_id)
             execution_path.parent.mkdir(parents=True, exist_ok=True)
+            for stale in (execution_path.with_suffix(".result.json"), execution_path.with_suffix(".submission.json"),
+                          self._local_outcome_path(manifest.subscriber_id, manifest.job_id)):
+                stale.unlink(missing_ok=True)
             from .worker_host import process_identity
             _write_json_atomic(execution_path, {"version": 1, "phase": "RESERVED", "proxy": process_identity(os.getpid()),
                                                "backend": self._file_job_backend(selected)})
@@ -699,7 +827,11 @@ class Proxy:
         payload["output_files"] = _inventory_with_retry(running)
         self._persist_local_outcome(manifest.subscriber_id, manifest.job_id, payload)
         _write_json_atomic(running / "proxy_result.json", payload)
-        answer = self._move_to_answer(running, manifest.subscriber_id, manifest.job_id)
+        try:
+            answer = self._move_to_answer(running, manifest.subscriber_id, manifest.job_id)
+        except AnswerCollision as exc:
+            self.logger(f"Answer collision for {manifest.subscriber_id}/{manifest.job_id}; attempt remains in Running for operator action: {exc}")
+            return None
         self.logger(
             f"Finished {manifest.subscriber_id}/{manifest.job_id}: "
             f"{status} in {result.duration_seconds:.3f}s"
@@ -710,10 +842,11 @@ class Proxy:
         self._clear_unsubmitted_guard()
         if self._orphan_count():
             return None
-        if (self.local_runtime_dir / "unsettled_comfyui.json").exists():
+        if self._local_admission_blocked():
             return None
         selected = self._select_file_job()
-        if selected is None:
+        self._clear_unsubmitted_guard()
+        if selected is None or self._local_admission_blocked():
             return None
         return self._process_file_job(selected)
 
@@ -721,7 +854,15 @@ class Proxy:
         guard = self.local_runtime_dir / "unsettled_comfyui.json"
         local = self._execution_path(folder.parent.name, folder.name).with_suffix(".submission.json")
         if local.is_file():
-            submission = json.loads(local.read_text(encoding="utf-8"))
+            try:
+                submission = json.loads(local.read_text(encoding="utf-8"))
+                if not isinstance(submission, dict):
+                    raise ValueError("submission sidecar must contain a JSON object")
+            except (OSError, UnicodeError, ValueError) as exc:
+                if not guard.exists():
+                    _write_json_atomic(guard, {"job_id": folder.name,
+                                               "reason": f"Local ComfyUI submission evidence is unreadable: {exc}"})
+                return
             if submission.get("settled") is not True and not guard.is_file():
                 _write_json_atomic(guard, submission)
             return
@@ -731,6 +872,8 @@ class Proxy:
         if path.is_file():
             try:
                 submission = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(submission, dict):
+                    raise ValueError("saved submission must contain a JSON object")
                 if submission.get("settled") is not True:
                     _write_json_atomic(self.local_runtime_dir / "unsettled_comfyui.json", {
                         "job_id": folder.name, "prompt_id": submission.get("prompt_id"),
@@ -740,10 +883,50 @@ class Proxy:
 
     def _clear_unsubmitted_guard(self):
         guard = self.local_runtime_dir / "unsettled_comfyui.json"
-        if guard.is_file() and json.loads(guard.read_text(encoding="utf-8")).get("phase") == "PREPARED":
-            guard.replace(guard.with_name(f"unsettled_comfyui.unsubmitted-{time.time_ns()}.json"))
-            return True
+        try:
+            if is_link_like(guard):
+                self.logger("ComfyUI guard is a link or reparse point; local execution remains blocked")
+                return False
+            if guard.is_file():
+                value = json.loads(guard.read_text(encoding="utf-8"))
+                if isinstance(value, dict) and value.get("phase") == "PREPARED":
+                    guard.replace(guard.with_name(f"unsettled_comfyui.unsubmitted-{time.time_ns()}.json"))
+                    return True
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            self.logger(f"ComfyUI guard is unreadable; local execution remains blocked: {exc}")
         return False
+
+    def _local_admission_blocked(self) -> bool:
+        state, _value = self._guard_state()
+        return state != "clear"
+
+    def _guard_state(self) -> tuple[str, dict[str, Any] | None]:
+        guard = self.local_runtime_dir / "unsettled_comfyui.json"
+        try:
+            guard.lstat()
+        except FileNotFoundError:
+            return "clear", None
+        except OSError as exc:
+            self.logger(f"ComfyUI guard cannot be inspected; local execution remains blocked: {exc}")
+            return "unreadable", None
+        try:
+            if is_link_like(guard):
+                raise ValueError("guard cannot be a link or reparse point")
+            if not guard.is_file():
+                raise ValueError("guard path is not a regular file")
+            value = json.loads(guard.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("guard must contain a JSON object")
+            return "guarded", value
+        except (OSError, UnicodeError, ValueError) as exc:
+            self.logger(f"ComfyUI guard is unreadable; local execution remains blocked: {exc}")
+            return "unreadable", None
+
+    def _guard_can_managed_recover(self) -> bool:
+        state, value = self._guard_state()
+        return (state == "guarded" and value is not None
+                and value.get("phase") in {"DISPATCHING", "ACCEPTED"}
+                and value.get("settled") is not True)
 
     async def _reconcile_unsettled_comfyui(self, backend_manager: BackendManager) -> None:
         """End ambiguous managed work before allowing another local attempt."""
@@ -765,7 +948,7 @@ class Proxy:
                 pending = {}
                 last_blocked = None
                 while not stop.is_set():
-                    unsettled = (self.local_runtime_dir / "unsettled_comfyui.json").exists()
+                    unsettled = self._local_admission_blocked()
                     blocked = unsettled or bool(self._orphan_count())
                     if blocked != last_blocked:
                         try:
@@ -818,9 +1001,12 @@ class Proxy:
                     if stop.wait(1):
                         return
                     request = self.control_root / "refresh-models.json"
-                    if request.is_file():
-                        request.unlink(missing_ok=True)
-                        break
+                    try:
+                        if request.is_file():
+                            request.unlink(missing_ok=True)
+                            break
+                    except OSError as exc:
+                        self.logger(f"Unable to clear model refresh request; retrying: {exc}")
         native = any("file_proxy.ai_worker" in registration.command
                      for workers in self.registry.subscribers.values() for registration in workers.values())
         catalog_thread = threading.Thread(target=refresh_catalog, name="proxy-model-catalog", daemon=True) if native else None
@@ -831,6 +1017,8 @@ class Proxy:
         finally:
             stop.set()
             thread.join()
+            if catalog_thread:
+                catalog_thread.join(timeout=5)
 
     async def run_scheduler(
         self,
@@ -858,8 +1046,8 @@ class Proxy:
         loop = asyncio.get_running_loop()
         while True:
             self._clear_unsubmitted_guard()
-            if (self.local_runtime_dir / "unsettled_comfyui.json").exists():
-                if backend_manager and backend_manager.config.enabled:
+            if self._local_admission_blocked():
+                if backend_manager and backend_manager.config.enabled and self._guard_can_managed_recover():
                     try:
                         await self._reconcile_unsettled_comfyui(backend_manager)
                         last_recovery_error = None
@@ -894,6 +1082,9 @@ class Proxy:
                 else:
                     deferred_selected = selected
                     selected = None
+            if self._local_admission_blocked():
+                await asyncio.sleep(max(0.01, poll_seconds))
+                continue
             http_job = None if selected is not None else http_queue.pop()
             if http_job is not None:
                 try:
@@ -929,6 +1120,9 @@ class Proxy:
                     await http_queue.wait(poll_seconds)
                     continue
             if http_queue.has_waiting() and selected is None:
+                continue
+            if self._local_admission_blocked():
+                await asyncio.sleep(max(0.01, poll_seconds))
                 continue
             if selected is None:
                 await http_queue.wait(poll_seconds)
@@ -992,7 +1186,12 @@ class Proxy:
         with self.lock():
             self.recover_interrupted()
             selected = self._select_file_job(include_cloud=True)
-            return self._process_file_job(selected) if selected is not None else None
+            self._clear_unsubmitted_guard()
+            if selected is None:
+                return None
+            if self._file_job_backend(selected) != "codex" and self._local_admission_blocked():
+                return None
+            return self._process_file_job(selected)
 
     def status(self, subscriber: str | None = None, job: str | None = None) -> dict[str, Any]:
         try:
@@ -1008,10 +1207,12 @@ class Proxy:
         except OSError as exc:
             return {"counts": None, "jobs": [dict(row, status="PAUSED_STORAGE") for row in self._status_cache],
                     "degraded": str(exc), "storage": self.storage.status()}
-        counts = {"queued": 0, "running": 0, "succeeded": 0, "failed": 0, "invalid": 0}
+        counts = {"queued": 0, "running": 0, "succeeded": 0, "failed": 0, "invalid": 0, "blocked": 0}
         items: list[dict[str, Any]] = []
         for state, root in (("queued", self.ask_root), ("running", self.running_root), ("answer", self.answer_root)):
             for subscriber_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+                if is_link_like(subscriber_dir):
+                    continue
                 if subscriber and subscriber_dir.name != subscriber:
                     continue
                 for job_dir in sorted(path for path in subscriber_dir.iterdir() if path.is_dir() and not path.name.startswith(".")):
@@ -1023,7 +1224,19 @@ class Proxy:
                         "display_state": "queued" if state == "queued" else "starting backend" if state == "running" else item_state,
                         "diagnostic": "", "worker": "", "trusted_worker_backend": None,
                     }
+                    if is_link_like(job_dir):
+                        item.update(status="blocked", display_state="blocked",
+                                    diagnostic="Job path is a link or reparse point")
+                        counts["blocked"] += 1
+                        items.append(item)
+                        continue
                     if state in {"queued", "running"}:
+                        if self._answer_occupied(subscriber_dir.name, job_dir.name):
+                            item.update(status="blocked", display_state="blocked",
+                                        diagnostic="Answer path already exists; resolve the duplicate job ID before publication")
+                            counts["blocked"] += 1
+                            items.append(item)
+                            continue
                         try:
                             manifest_data = json.loads((job_dir / "job.json").read_text(encoding="utf-8"))
                             manifest = JobManifest.from_dict(manifest_data)
@@ -1052,8 +1265,14 @@ class Proxy:
                             item_state = "failed"
                     counts[item_state] += 1
                     items.append(item)
-        blocked = (self.local_runtime_dir / "unsettled_comfyui.json").exists() or bool(self._orphan_count())
+        guard_state, _guard_value = self._guard_state()
+        guard_blocked = guard_state != "clear"
+        blocked = guard_blocked or bool(self._orphan_count())
         self._status_cache = items
         return {"counts": counts, "jobs": items, "degraded": self._filesystem_degraded,
                 "storage": self.storage.status(),
-                "local_execution_blocked": blocked, "cloud_concurrency": self.cloud_concurrency}
+                "local_execution_blocked": blocked,
+                "local_execution_block_reason": ("ComfyUI guard is unreadable; operator recovery is required"
+                                                  if guard_state == "unreadable" else
+                                                  "ComfyUI submission is unresolved" if guard_blocked else ""),
+                "cloud_concurrency": self.cloud_concurrency}

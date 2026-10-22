@@ -5,9 +5,9 @@
 [pyproject.toml](../pyproject.toml) declares Python >=3.10, setuptools build,
 aiohttp and Textual runtime dependencies, and pytest in `[dev]`. Use a local
 `.venv` for installation and execution. Observed environment: Windows/PowerShell,
-Python 3.14.6. Python 3.10 compatibility is unverified: [reasoning_policy.py](../file_proxy/reasoning_policy.py)
-imports `datetime.UTC`, which was introduced in Python 3.11. Do not claim the
-declared minimum was tested or change dependencies/code as part of documentation.
+Python 3.14.6. The code uses `datetime.timezone.utc` for compatibility with the
+declared Python 3.10 minimum. Python 3.10 runtime validation remains unavailable
+on this host.
 
 Documented setup commands (not executed during the knowledge-base task):
 
@@ -26,15 +26,16 @@ the equivalent interpreter is `.venv/bin/python`; this platform was not exercise
 
 Run from repository root. Only label commands verified when they succeeded in
 the current environment. Before the test-suite replacement, the legacy suite
-passed 69 tests and skipped one Windows symlink test. Its individual checks are
-now represented by five end-to-end scenarios. Baseline was collected on
-2026-10-11:
+passed 69 tests and skipped one Windows symlink test. Its individual checks were
+initially represented by five end-to-end scenarios in the 2026-10-11 baseline.
+The maintained suite now has six isolated scenarios; the sixth was separately
+approved and added on 2026-10-16:
 
 | Command | Observed status |
 | --- | --- |
 | `.\.venv\Scripts\python.exe --version` | Passed; Python 3.14.6. |
 | `.\.venv\Scripts\python.exe -m file_proxy.cli --help` | Passed; parser exposes `run`, `tui`, `once`, `status`, `validate-subscriber`. Does not load registries or touch a queue. |
-| `.\.venv\Scripts\python.exe -m pytest -q` | Passed after replacement: 5 isolated end-to-end scenarios; the live backend scenario was deselected. |
+| `.\.venv\Scripts\python.exe -m pytest -q` | Historical 2026-10-11 baseline: 5 isolated end-to-end scenarios; the live backend scenario was deselected. Current count and results are recorded in later dated entries below. |
 
 The replacement policy scenario advances and verifies the policy file timestamp
 before checking reload. It does not change application reload logic. The earlier
@@ -86,7 +87,7 @@ deployment, select a registry directory containing only the intended registratio
 
 [run_file_proxy.ps1](../run_file_proxy.ps1) and [run_file_proxy.bat](../run_file_proxy.bat)
 launch `tui` using venv Python. Both default the Ollama listener to `11433`, upstream
-`11434`, queue to `%USERPROFILE%\Dropbox\AI_Queue`, and Zet checkout to a sibling.
+`11434`, queue to `E:\Zet\AI_Queue`, and Zet checkout to a sibling.
 They check Zet `config.toml` exists. They do not enable a ComfyUI HTTP listener.
 PowerShell does not change cwd; BAT changes to repo root, so configless relative
 runtime storage can differ when launched elsewhere.
@@ -207,3 +208,15 @@ metadata excludes the workflow graph. One background probe worker per monitor
 bounds status wait time and leaves unrelated verified resources usable during a
 stalled device call. Physical drive disconnects, live providers and production
 restart/deployment were not exercised. See [ADR 0006](DECISIONS/0006-storage-outage-recovery.md).
+
+
+## Independent code review remediation (2026-10-22)
+
+The six existing isolated scenarios passed (`6 passed, 1 deselected`). Python
+compilation and `git diff --check` passed. Disposable checks verified Windows
+junction rejection and safe INVALID publication, ambiguous/PREPARED/corrupt
+guard behavior, corrupt storage journal blocking, and Answer collision
+preservation. Relative Markdown links in the changed docs resolved. No tests
+were added or expanded, no real queue or live backend was used, and Python 3.10
+runtime validation remains unavailable on this host. The opt-in live scenario
+was deselected.

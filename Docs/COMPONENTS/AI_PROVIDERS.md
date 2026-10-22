@@ -46,6 +46,9 @@ ComfyUI backend and verifies the endpoint is gone before archiving the guard as
 `unsettled_comfyui.recovered-<timestamp>.json` and resuming admission. The original
 failed/interrupted attempt remains terminal; no saved workflow is resubmitted.
 External mode or an unowned reachable backend retains the guard for intervention.
+The one-shot command applies the same local admission fence but does not own a
+backend manager, so ambiguous state remains blocked there. An unreadable or
+link-like guard is also held for operator recovery rather than automatically cleared.
 See [recovery ADR](../DECISIONS/0005-managed-native-comfyui-recovery.md).
 
 ## Capability metadata

@@ -21,6 +21,7 @@ from .scheduler import HttpQueue
 from .backend import BackendManager, BackendUnavailable
 from .diagnostics import RequestDiagnosticLog
 from .store import ExecutionStore
+from .validation import is_link_like
 from .runtime import RuntimeConfig
 from .reasoning_policy import ReasoningPolicyStore
 
@@ -285,7 +286,7 @@ def _managed_output_path(arguments: tuple[str, ...], working_directory: str | No
         target = output_root.joinpath(*folder_posix.parts, *posix.parts)
         resolved = target.resolve(strict=True)
         resolved.relative_to(output_root)
-        if resolved.is_file() and not target.is_symlink():
+        if resolved.is_file() and not is_link_like(target):
             return resolved
     except (ValueError, IndexError, OSError):
         return None
@@ -363,6 +364,10 @@ class AdmissionController:
     async def release_bytes(self, amount: int) -> None:
         async with self._lock:
             self.bytes = max(0, self.bytes - amount)
+
+
+class PromptIdConflict(RuntimeError):
+    """Upstream accepted an ID already owned by another local execution."""
 
 
 @dataclass
@@ -507,14 +512,24 @@ class HttpProxyService:
             if record.get("backend") != "comfyui" or not isinstance(prompt_id, str):
                 self.store.update(record["request_id"], "failed", outcome="restart", error="ambiguous execution after proxy restart")
                 continue
+            if self.profile.name != "comfyui":
+                continue
             history = await self._wait_for_prompt_completion(prompt_id, "/prompt", timeout=0.25)
             if history is not None:
                 await self._archive_completion(record["request_id"], prompt_id, history)
             elif self.backend_manager and self.backend_manager.config.enabled:
-                self.store.update(record["request_id"], "failed", outcome="restart", error="owned backend ended with previous proxy")
-            elif self.backend_manager:
-                self.backend_manager.block(f"Prompt {prompt_id} was unresolved at restart; reconcile it before GPU execution")
-                self.store.update(record["request_id"], "blocked", outcome="unresolved", error=self.backend_manager.blocked_reason)
+                try:
+                    await self.backend_manager.stop_comfyui()
+                except BackendUnavailable as exc:
+                    self.backend_manager.block(f"Prompt {prompt_id} remains unresolved after restart: {exc}")
+                    self.store.update(record["request_id"], "blocked", outcome="unresolved", error=str(exc))
+                else:
+                    self.store.update(record["request_id"], "failed", outcome="restart", error="owned backend was stopped and verified after restart")
+            else:
+                reason = f"Prompt {prompt_id} was unresolved at restart; reconcile it before GPU execution"
+                if self.backend_manager:
+                    self.backend_manager.block(reason)
+                self.store.update(record["request_id"], "blocked", outcome="unresolved", error=reason)
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
         route = (request.method, request.path)
@@ -540,8 +555,11 @@ class HttpProxyService:
                         f"operation={normalized.operation} effective={normalized.effective or 'unknown'} "
                         f"revision={normalized.revision_id or 'unknown'}"
                     )
+        except UnicodeError as exc:
+            await self.admission.leave(buffered)
+            raise web.HTTPBadRequest(text="request body cannot be normalized as UTF-8") from exc
         except BaseException:
-            await self.admission.leave(0)
+            await self.admission.leave(buffered)
             raise
 
         try:
@@ -561,8 +579,9 @@ class HttpProxyService:
             # completes; handler cancellation (client disconnect) cannot
             # release the slot early.
             response = asyncio.get_running_loop().create_future()
+            lifecycle_state = {"started": False}
             lifecycle = asyncio.create_task(
-                self._run_prompt_lifecycle(request, job, response, body, buffered),
+                self._run_prompt_lifecycle(request, job, response, body, buffered, lifecycle_state),
                 name=f"prompt-lifecycle-{job.request_id}",
             )
             self._lifecycle_tasks.add(lifecycle)
@@ -573,6 +592,9 @@ class HttpProxyService:
                 if not job.dispatched:
                     self.queue.cancel(job)
                     lifecycle.cancel()
+                    await asyncio.gather(lifecycle, return_exceptions=True)
+                    if not lifecycle_state["started"]:
+                        await self.admission.leave(buffered)
                 raise
         resource_tag = f"[{job.resource_key}] " if job.resource_key else ""
         try:
@@ -769,6 +791,7 @@ class HttpProxyService:
         response: asyncio.Future[web.StreamResponse],
         body: bytes,
         buffered: int,
+        lifecycle_state: dict[str, bool] | None = None,
     ) -> None:
         """Settle-route lifecycle that holds the slot until the prompt settles.
 
@@ -779,9 +802,12 @@ class HttpProxyService:
         releases the slot cleanly.
         """
         profile = self.profile
+        if lifecycle_state is not None:
+            lifecycle_state["started"] = True
         started = False
         known_id: str | None = None
         dispatched = False
+        prompt_id_conflict = False
         try:
             try:
                 await asyncio.wait_for(asyncio.shield(job.started), self.config.queue_wait_seconds)
@@ -850,12 +876,13 @@ class HttpProxyService:
                                 f"{profile.name} upstream returned prompt id {returned_id} "
                                 f"different from preassigned {known_id}; tracking the returned id"
                             )
-                            known_id = returned_id
                             if self.store:
                                 try:
                                     self.store.reconcile_prompt_id(job.request_id, returned_id)
                                 except FileExistsError:
-                                    raise web.HTTPConflict(text="upstream returned an already tracked prompt_id") from None
+                                    prompt_id_conflict = True
+                                    raise PromptIdConflict("upstream returned an already tracked prompt_id") from None
+                            known_id = returned_id
                         else:
                             known_id = returned_id or known_id
                     header_pairs = _forward_headers(upstream.headers, request=False)
@@ -892,6 +919,17 @@ class HttpProxyService:
                             await self._cancel_and_reconcile(job.request_id, known_id, request.path)
                     elif self.store:
                         self.store.update(job.request_id, "failed", outcome="rejected", error=f"upstream status {status}")
+            except PromptIdConflict as exc:
+                reason = f"ComfyUI returned a prompt ID owned by another execution: {exc}"
+                if self.store:
+                    self.store.update(job.request_id, "blocked", outcome="prompt_id_conflict", error=reason)
+                if self.backend_manager:
+                    self.backend_manager.block(reason)
+                if not response.done():
+                    response.set_exception(web.HTTPConflict(text=reason))
+                # The accepted execution cannot safely be reconciled under the
+                # other request's ID. Retain the local slot until shutdown.
+                await asyncio.Event().wait()
             except asyncio.TimeoutError:
                 self.logger(
                     f"{profile.name} upstream failed for request {job.request_id}"
@@ -931,7 +969,7 @@ class HttpProxyService:
                             web.HTTPBadGateway(text="upstream request failed")
                         )
         except asyncio.CancelledError:
-            if self.store and dispatched:
+            if self.store and dispatched and not prompt_id_conflict:
                 self.store.update(job.request_id, "failed", outcome="shutdown", error="proxy stopped during reconciliation")
             if not response.done():
                 response.cancel()
@@ -1358,9 +1396,17 @@ async def run_http_proxies(
                 started.append(service)
                 if runtime_state is not None:
                     runtime_state.listener_states[service.profile.name] = "listening"
-            if services:
-                reconciliation_service = next((service for service in services if service.profile.name == "comfyui"), services[0])
+            reconciliation_service = next((service for service in services if service.profile.name == "comfyui"), None)
+            if reconciliation_service:
                 await reconciliation_service.reconcile_records()
+            elif store:
+                pending_comfyui = [record for record in store.pending() if record.get("backend") == "comfyui"]
+                if pending_comfyui:
+                    reason = "ComfyUI listener is unavailable for restart reconciliation"
+                    if manager:
+                        manager.block(reason)
+                    for record in pending_comfyui:
+                        store.update(record["request_id"], "blocked", outcome="unresolved", error=reason)
             if runtime_state is not None:
                 runtime_state.ready.set()
         except BaseException:
