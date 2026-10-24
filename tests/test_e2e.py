@@ -8,6 +8,7 @@ import sys
 
 from aiohttp import ClientSession, web
 
+from file_proxy import ai_worker
 from file_proxy.engine import Proxy
 from file_proxy.http_proxy import COMFYUI_PROFILE, OLLAMA_PROFILE, HttpProxyConfig, HttpRuntimeState, run_http_proxies
 from file_proxy.runtime import ManagedComfyUIConfig, RuntimeConfig
@@ -87,6 +88,83 @@ def test_file_jobs_wait_for_complete_inputs_and_publish_terminal_results(tmp_pat
         assert json.loads((invalid / "proxy_result.json").read_text())["status"] == "FAILED"
         assert "unsafe referenced path" in json.loads((invalid / "proxy_result.json").read_text())["error_message"]
         assert counter.read_text(encoding="utf-8").splitlines() == ["complete", "failure", "unsafe"]
+
+    asyncio.run(scenario())
+
+
+def test_comfyui_worker_retries_transient_submission_guard_sharing_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    async def scenario() -> None:
+        prompt_posts: list[dict[str, object]] = []
+
+        async def object_info(_request: web.Request) -> web.Response:
+            return web.json_response({"CheckpointLoaderSimple": {}})
+
+        async def prompt(request: web.Request) -> web.Response:
+            value = await request.json()
+            prompt_posts.append(value)
+            return web.json_response({"prompt_id": value["prompt_id"]})
+
+        async def history(request: web.Request) -> web.Response:
+            prompt_id = request.match_info["prompt_id"]
+            return web.json_response({prompt_id: {
+                "status": {"status_str": "success"},
+                "outputs": {"1": {"images": [{"filename": "render.png", "subfolder": "", "type": "output"}]}},
+            }})
+
+        async def view(_request: web.Request) -> web.Response:
+            return web.Response(body=b"controlled image", content_type="image/png")
+
+        app = web.Application()
+        app.router.add_get("/object_info", object_info)
+        app.router.add_post("/prompt", prompt)
+        app.router.add_get("/history/{prompt_id}", history)
+        app.router.add_get("/view", view)
+        runner, port = await start_server(app)
+
+        root = tmp_path / "job"
+        root.mkdir()
+        runtime_dir = tmp_path / "runtime"
+        runtime_dir.mkdir()
+        (root / "ask_manifest.json").write_text(json.dumps({"ask_id": "guard-retry"}), encoding="utf-8")
+        (root / "ai_request.json").write_text(json.dumps({
+            "version": 1,
+            "provider": "comfyui",
+            "model": "controlled",
+            "workflow": {"1": {"class_type": "CheckpointLoaderSimple", "inputs": {}}},
+            "output": "answer.png",
+        }), encoding="utf-8")
+        guard = runtime_dir / "unsettled_comfyui.json"
+        original_replace = os.replace
+        injected = False
+        attempts = 0
+
+        def replace_with_one_sharing_failure(source, destination):
+            nonlocal injected, attempts
+            if Path(destination) == guard:
+                payload = json.loads(Path(source).read_text(encoding="utf-8"))
+                if payload.get("phase") == "ACCEPTED":
+                    attempts += 1
+                    if not injected:
+                        injected = True
+                        raise PermissionError(5, "Access is denied", str(destination))
+            return original_replace(source, destination)
+
+        monkeypatch.setattr(ai_worker.os, "replace", replace_with_one_sharing_failure)
+        monkeypatch.setenv("AI_PROXY_RUNTIME_DIR", str(runtime_dir))
+        try:
+            succeeded = await asyncio.to_thread(
+                ai_worker.execute, root, "comfyui", comfyui=f"http://127.0.0.1:{port}"
+            )
+            assert succeeded
+            assert injected and attempts == 2
+            assert len(prompt_posts) == 1
+            assert not guard.exists()
+            assert (root / "answer.png").read_bytes() == b"controlled image"
+            assert json.loads((root / "ai_result.json").read_text(encoding="utf-8"))["status"] == "SUCCESS"
+        finally:
+            await runner.cleanup()
 
     asyncio.run(scenario())
 

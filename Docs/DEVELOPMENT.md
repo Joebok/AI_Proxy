@@ -118,6 +118,7 @@ coordinate different runtime directories or machines.
 | Backend shown unreachable | `/api/ps` and ComfyUI `/queue`; listener readiness does not prove backend readiness. `/system_stats` is not a render-success check. |
 | Managed prompt unresolved | Durable lifecycle record, keyed history and cancellation branch; owned backend may be stopped, external ambiguous work retains slot. No replay. |
 | Native ComfyUI jobs held across restart | Inspect local `unsettled_comfyui.json`. Managed scheduler now stops/verifies its owned backend, archives the guard and resumes automatically; the failed/interrupted attempt stays terminal. External ownership or stop/archive failures retain the hold. See [recovery decision](DECISIONS/0005-managed-native-comfyui-recovery.md). |
+| Native ComfyUI guard sharing violation | Worker JSON replacement/settled guard deletion and managed guard archival retry `PermissionError` for up to 15 seconds. Persistent errors fail closed: keep durable ambiguity evidence and do not replay the prompt. |
 | Dashboard error/restart | Supervisor logs/listener bind state; `S` stops, `R` restarts, `End` follows logs, `Q`/Ctrl+C exits. Active file workers finish before safe stop. |
 | Policy does not reload | Optional path, JSON validation/status error, last-known-good state, timestamp change detection; inspect observed failing test. |
 

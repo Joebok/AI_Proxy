@@ -78,7 +78,11 @@ not reload changed configuration files from disk. Restart the CLI for new settin
 
 Dashboard mounts with automatic start, refreshes once per second, renders snapshots,
 and invokes supervisor via key actions. Logs use a 2,000-entry bound and sequence
-cursor; markup from messages is escaped. `S`: stop and keep UI; `R`: restart;
+cursor; markup from messages is escaped. File execution start, finish and collision
+entries use the trusted backend; HTTP listener entries use their profile, shown as
+`ComfyUI (file)`, `Ollama (http)`, etc. File workers without a backend declaration
+show their worker name. General queue messages show `Proxy (file)` or
+`Proxy (http)`. `S`: stop and keep UI; `R`: restart;
 PgUp/PgDn: scroll; End: follow; Q/Ctrl+C: safe stop and exit.
 
 ## Failure modes, extension, verification
@@ -97,6 +101,8 @@ also satisfies this check after restart. Stop/probe/archive failures keep the
 guard; a reachable unowned process still requires intervention. Failed/interrupted
 attempts retain their terminal outcomes and are never replayed. This recovery
 does not clear arbitrary `blocked_reason` values or change HTTP settlement.
+Guard archival retries sharing violations for up to 15 seconds off the asyncio
+event loop; if the retry expires, the existing scheduler retry keeps admission held.
 
 Backend additions need registration/profile validation, lifecycle/health contracts,
 scheduler backend resolution, CLI/TUI configuration and tests; a new name alone is

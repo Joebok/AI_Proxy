@@ -234,7 +234,7 @@ class ProxyDashboard(App[None]):
                 continue
             line = Text()
             line.append(entry.timestamp.strftime("%H:%M:%S"), style="bright_black")
-            line.append(f"  {entry.source:<11}", style="blue")
+            line.append(f"  {entry.source:<16}", style="blue")
             level_style = {
                 "success": "green",
                 "warning": "yellow",

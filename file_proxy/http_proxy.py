@@ -1279,6 +1279,8 @@ async def run_http_proxies(
     http_logger: Callable[[str], None] | None = None,
     runtime_config: RuntimeConfig | None = None,
     runtime_state: HttpRuntimeState | None = None,
+    *,
+    service_logger_factory: Callable[[str], Callable[[str], None]] | None = None,
 ) -> None:
     if not configs and not (runtime_config and runtime_config.managed_comfyui.enabled):
         raise ValueError("At least one HTTP listener configuration is required")
@@ -1336,7 +1338,7 @@ async def run_http_proxies(
         HttpProxyService(
             config,
             queue,
-            logger,
+            service_logger_factory(config.profile.name) if service_logger_factory else logger,
             admission=admission,
             store=store,
             backend_manager=manager,

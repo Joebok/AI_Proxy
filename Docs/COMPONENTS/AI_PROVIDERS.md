@@ -22,6 +22,9 @@ request's system/task wording. It does not rewrite prompts or select another mod
 ComfyUI validates required graph nodes after backend preparation, materializes input
 bindings through upload responses, journals submission identity, waits for keyed
 terminal history and copies the output into the envelope before terminal publication.
+Native worker JSON replacements and settled guard deletion retry permission failures
+for up to 15 seconds with exponential backoff. The durable `DISPATCHING` guard is
+written before `/prompt`; retry exhaustion fails the attempt and never repeats POST.
 
 Workers write `answer_manifest.json` and `ai_result.json` with success/failure,
 runtime/model evidence, timestamps and bounded error text. Proxy transport results

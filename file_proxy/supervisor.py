@@ -11,6 +11,12 @@ from .http_proxy import HttpProxyConfig, HttpRuntimeState, run_http_proxies
 from .runtime import RuntimeConfig
 
 
+def _tool_name(backend: str) -> str:
+    return {"comfyui": "ComfyUI", "ollama": "Ollama", "codex": "Codex"}.get(
+        backend, backend
+    )
+
+
 @dataclass(frozen=True)
 class LogEntry:
     sequence: int
@@ -76,7 +82,10 @@ class RuntimeSupervisor:
         self._logs: deque[LogEntry] = deque(maxlen=log_capacity)
         self._log_lock = threading.Lock()
         self._log_sequence = 0
-        self.proxy.logger = lambda message: self.log("file-proxy", message)
+        self.proxy.logger = lambda message: self.log("Proxy (file)", message)
+        self.proxy.job_logger = lambda backend, message: self.log(
+            f"{_tool_name(backend)} (file)", message
+        )
 
     @property
     def transitioning(self) -> bool:
@@ -129,9 +138,12 @@ class RuntimeSupervisor:
                         self.proxy,
                         list(self.configs),
                         self.poll_seconds,
-                        lambda message: self.log("http-proxy", message),
+                        lambda message: self.log("Proxy (http)", message),
                         self.runtime_config,
                         state,
+                        service_logger_factory=lambda backend: lambda message: self.log(
+                            f"{_tool_name(backend)} (http)", message
+                        ),
                     ),
                     name="ai-proxy-runtime",
                 )

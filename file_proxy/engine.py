@@ -162,6 +162,7 @@ class Proxy:
         self.ollama_upstream = "http://127.0.0.1:11434"
         self.comfyui_upstream = "http://127.0.0.1:8188"
         self.logger = logger or (lambda _message: None)
+        self.job_logger: Callable[[str, str], None] | None = None
         self.sync_grace_seconds = sync_grace_seconds
         self.max_resource_streak = max_resource_streak
         self._resource_key: str | None = None
@@ -701,7 +702,15 @@ class Proxy:
         queued = selected
         manifest = queued.manifest
         resource_tag = f"[{manifest.resource_key}] " if manifest.resource_key else ""
-        self.logger(
+        backend = self._file_job_backend(queued)
+
+        def log_job(message: str) -> None:
+            if self.job_logger is None:
+                self.logger(message)
+            else:
+                self.job_logger(backend or manifest.worker, message)
+
+        log_job(
             f"{resource_tag}Starting {manifest.subscriber_id}/{manifest.job_id} "
             f"with worker {manifest.worker}"
         )
@@ -830,9 +839,12 @@ class Proxy:
         try:
             answer = self._move_to_answer(running, manifest.subscriber_id, manifest.job_id)
         except AnswerCollision as exc:
-            self.logger(f"Answer collision for {manifest.subscriber_id}/{manifest.job_id}; attempt remains in Running for operator action: {exc}")
+            log_job(
+                f"Answer collision for {manifest.subscriber_id}/{manifest.job_id}; "
+                f"attempt remains in Running for operator action: {exc}"
+            )
             return None
-        self.logger(
+        log_job(
             f"Finished {manifest.subscriber_id}/{manifest.job_id}: "
             f"{status} in {result.duration_seconds:.3f}s"
         )
@@ -936,7 +948,7 @@ class Proxy:
         await backend_manager.stop_comfyui()
         guard = self.local_runtime_dir / "unsettled_comfyui.json"
         archive = guard.with_name(f"unsettled_comfyui.recovered-{time.time_ns()}.json")
-        guard.replace(archive)
+        await asyncio.to_thread(_replace_with_retry, guard, archive)
         self.logger(f"Recovered unresolved ComfyUI submission after verified backend stop; saved {archive.name}. Local execution resumes.")
 
     @contextmanager

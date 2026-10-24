@@ -28,7 +28,21 @@ def write_json(path: Path, value) -> None:
         handle.write(json.dumps(value, indent=2) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    _retry_permission_error(lambda: os.replace(temporary, path))
+
+
+def _retry_permission_error(operation, timeout_seconds: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    delay = 0.05
+    while True:
+        try:
+            operation()
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 1.0)
 
 
 def save_submission(root, submission):
@@ -52,7 +66,7 @@ def save_submission(root, submission):
                 # Preserve unreadable safety evidence for proxy-side recovery.
                 saved = None
             if isinstance(saved, dict) and saved.get("job_id") == root.name:
-                guard.unlink()
+                _retry_permission_error(guard.unlink)
     write_json(root / "comfyui_submission.json", submission)
 
 
