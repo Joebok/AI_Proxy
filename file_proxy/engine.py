@@ -21,7 +21,7 @@ from .models import InvalidJob, JobManifest, JobNotReady, ProxyResult, QueueJob,
 from .registry import Registry
 from .scheduler import HttpQueue
 from .backend import BackendManager, BackendUnavailable
-from .validation import build_file_inventory, find_link_like, is_link_like, remove_link_like, validate_job_folder
+from .validation import FileValidationCache, build_file_inventory, find_link_like, is_link_like, remove_link_like, validate_job_folder
 from .storage_health import StorageHealth, StorageUnavailable
 
 
@@ -171,6 +171,7 @@ class Proxy:
         self.forge_unload_timeout_seconds = forge_unload_timeout_seconds
         self.forge_cleanup_required = forge_cleanup_required
         self._not_ready_since: dict[Path, float] = {}
+        self._validation_cache = FileValidationCache()
         self.ask_root = self.root / "Ask"
         self.running_root = self.root / "Running"
         self.answer_root = self.root / "Answer"
@@ -193,7 +194,10 @@ class Proxy:
 
     def _queue_ready(self) -> bool:
         try:
+            was_degraded = self._filesystem_degraded is not None
             self.ensure_layout()
+            if was_degraded:
+                self._validation_cache.clear()
             with self._scan_guard:
                 if not self._storage_reconciled:
                     self.recover_interrupted()
@@ -205,6 +209,7 @@ class Proxy:
                 self.logger(f"Filesystem queue paused; retrying automatically: {exc}")
             self._filesystem_degraded = str(exc)
             self._storage_reconciled = False
+            self._validation_cache.clear()
             self.storage.poll(force=True)
             return False
 
@@ -489,6 +494,7 @@ class Proxy:
         self.storage.require("queue")
         jobs: list[QueueJob] = []
         invalid: list[tuple[Path, str, str, str]] = []
+        present: set[Path] = set()
         for subscriber_dir in sorted(path for path in self.ask_root.iterdir() if path.is_dir()):
             if subscriber_dir.name.startswith("."):
                 continue
@@ -497,10 +503,11 @@ class Proxy:
             for job_dir in sorted(path for path in subscriber_dir.iterdir() if path.is_dir()):
                 if job_dir.name.startswith("."):
                     continue
+                present.add(job_dir)
                 if self._answer_occupied(subscriber_dir.name, job_dir.name):
                     continue
                 try:
-                    manifest = validate_job_folder(job_dir, subscriber_dir.name, job_dir.name)
+                    manifest = self._validation_cache.validate(job_dir, subscriber_dir.name, job_dir.name)
                     if self.registry.worker(manifest.subscriber_id, manifest.worker) is None:
                         raise InvalidJob(f"unknown worker {manifest.worker!r} for subscriber {manifest.subscriber_id!r}")
                     jobs.append(QueueJob(job_dir, manifest))
@@ -525,6 +532,7 @@ class Proxy:
                 except InvalidJob as exc:
                     self._not_ready_since.pop(job_dir, None)
                     invalid.append((job_dir, subscriber_dir.name, job_dir.name, str(exc)))
+        self._validation_cache.discard_except(present)
         jobs.sort(key=lambda item: (
             -item.manifest.priority,
             item.manifest.created_at,
@@ -701,6 +709,22 @@ class Proxy:
             return self._invalid(*selected)
         queued = selected
         manifest = queued.manifest
+        # Recheck bytes immediately before claiming. The scheduler cache is never
+        # an execution authorization and can only accelerate discovery/status.
+        try:
+            current_manifest = validate_job_folder(queued.path, manifest.subscriber_id, manifest.job_id)
+        except JobNotReady as exc:
+            first_seen = self._not_ready_since.setdefault(queued.path, time.monotonic())
+            if time.monotonic() - first_seen >= self.sync_grace_seconds:
+                return self._invalid(queued.path, manifest.subscriber_id, manifest.job_id,
+                                     f"sync did not complete within {self.sync_grace_seconds:g}s: {exc}")
+            return None
+        except InvalidJob as exc:
+            return self._invalid(queued.path, manifest.subscriber_id, manifest.job_id, str(exc))
+        if current_manifest != manifest:
+            return self._invalid(queued.path, manifest.subscriber_id, manifest.job_id,
+                                 "job manifest changed after queue selection")
+        self._validation_cache.invalidate(queued.path)
         resource_tag = f"[{manifest.resource_key}] " if manifest.resource_key else ""
         backend = self._file_job_backend(queued)
 
@@ -1260,7 +1284,11 @@ class Proxy:
                                 item["diagnostic"] = f"Unknown trusted worker: {manifest.worker}"
                             else:
                                 item["trusted_worker_backend"] = registration.backend
-                            validate_job_folder(job_dir, subscriber_dir.name, job_dir.name)
+                            cached, diagnostic = self._validation_cache.peek(job_dir)
+                            if not cached and state == "queued":
+                                item["diagnostic"] = "Job input validation will run before execution"
+                            elif diagnostic is not None:
+                                item["diagnostic"] = str(diagnostic)
                         except (InvalidJob, JobNotReady) as exc:
                             item["diagnostic"] = str(exc)
                         except (OSError, UnicodeError, json.JSONDecodeError) as exc:

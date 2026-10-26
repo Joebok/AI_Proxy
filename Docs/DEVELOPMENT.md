@@ -221,3 +221,12 @@ preservation. Relative Markdown links in the changed docs resolved. No tests
 were added or expanded, no real queue or live backend was used, and Python 3.10
 runtime validation remains unavailable on this host. The opt-in live scenario
 was deselected.
+
+## Queue validation cache (2026-10-26)
+
+The isolated default suite passed: **7 passed, 1 deselected**. `py_compile` and
+`git diff --check` passed. A disposable cache check confirmed warm validation
+reuse, changed-input rejection, and cache clearing; the cache remains process-local
+and execution still performs a fresh full checksum validation before claim.
+No production queue or live backend was used. Python 3.10 and physical E: reconnect
+behavior were not exercised.

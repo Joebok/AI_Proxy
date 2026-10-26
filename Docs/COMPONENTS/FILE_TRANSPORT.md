@@ -22,13 +22,19 @@ and execution internals. `process_once` assumes its caller owns runtime coordina
    manifest last, and publishes via same-filesystem rename. Hidden candidates are
    ignored; no publisher service is implemented here.
 2. `_select_file_job` first republishes completed Running outcomes, then `_scan`
-   validates visible asks and registry membership. A missing/malformed manifest
+   validates visible asks and registry membership. A process-local cache reuses
+   successful or incomplete validation while the envelope and directory-entry
+   identities, sizes, and timestamps remain unchanged. Status reads inspect this
+   metadata and cached diagnostics without hashing payload bytes. A missing/malformed manifest
    or declared file mismatch raises `JobNotReady`: first-seen monotonic time is
    remembered in memory until sync grace expires. Restart resets that timer.
    Invalid contracts and malformed other JSON become `INVALID` answers.
 3. Selection returns either `QueueJob` or an invalid-job tuple. Invalid publication
    does not acquire/start a backend. Valid ordering follows [SCHEDULING.md](SCHEDULING.md).
-4. Async managed execution prepares backend first; `_process_file_job` moves ask
+   A changed entry invalidates cached validation; disappeared jobs are evicted.
+4. Immediately before moving Ask to Running, execution performs a fresh full checksum
+   validation and requires the manifest to match the selected identity. Async managed
+   execution prepares backend first; `_process_file_job` moves ask
    to Running, prepares Forge when needed, records resource affinity, and scans
    the file queue for advisory next-resource hints.
 5. `subprocess.run` uses registry argv + `--job-dir <absolute Running path>`,
@@ -45,6 +51,10 @@ and execution internals. `process_once` assumes its caller owns runtime coordina
    journal. An Answer collision leaves the current envelope in place, is reported
    as blocked, and does not overwrite the prior Answer or replay the worker.
    Invalid-job publication follows the same collision handling.
+
+The cache is process-local and disposable. Storage interruption/reconnect clears it;
+restart also begins cold. It is only a scan/status optimization and never authorizes
+execution. Post-worker validation and complete output inventory remain unchanged.
 8. Subscriber validates full result inventory, copies artifacts durably, applies
    business updates idempotently, then owns retention. Queue listings alone are
    not an authoritative business state machine.
