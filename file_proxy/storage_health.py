@@ -92,7 +92,7 @@ class StorageHealth:
                 self._probe_thread = threading.Thread(target=self._probe_cycle, args=(event,),
                                                        name="storage-health", daemon=True)
                 self._probe_thread.start()
-        if not event.wait(1):
+        if not event.wait(5):
             with self._lock:
                 self._probe_timed_out = True
                 name = self._probing_name or next(iter(self.resources))
