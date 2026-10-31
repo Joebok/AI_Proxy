@@ -1,5 +1,7 @@
 # Filesystem transport and one-job workers
 
+Execution-status metadata includes a 30-second heartbeat, the active ComfyUI job identity, and health classification. A guard belonging to the active worker is busy; an unresolved guard without that worker requires attention. Scheduler admission is unchanged.
+
 ## Responsibility and interfaces
 
 The proxy validates eventually synced envelopes, runs one trusted local worker,

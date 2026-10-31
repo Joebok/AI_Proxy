@@ -983,17 +983,28 @@ class Proxy:
             with ThreadPoolExecutor(max_workers=self.cloud_concurrency, thread_name_prefix="proxy-cloud") as pool:
                 pending = {}
                 last_blocked = None
+                last_health_state = None
+                last_health = 0.0
                 while not stop.is_set():
                     unsettled = self._local_admission_blocked()
                     blocked = unsettled or bool(self._orphan_count())
-                    if blocked != last_blocked:
+                    _, guard = self._guard_state()
+                    guard_job = str((guard or {}).get("job_id") or "")
+                    with self._scan_guard:
+                        active = any(job_id == guard_job for _, job_id in self._active_jobs)
+                    health = "busy" if guard_job and active else "attention" if blocked else "ready"
+                    if blocked != last_blocked or health != last_health_state or time.monotonic() - last_health >= 30:
                         try:
                             _write_json_atomic(self.control_root / "execution_status.json", {
                                 "local_execution_blocked": blocked,
                                 "reason": ("ComfyUI submission is unresolved; reconcile the proxy's saved prompt before local execution resumes." if unsettled else
                                            "A surviving worker still owns local execution; waiting for it to finish." if blocked else ""),
+                                "health": health, "active_job": guard_job if active else "",
+                                "observed_at": iso_utc(utc_now()),
                                 "cloud_concurrency": self.cloud_concurrency})
                             last_blocked = blocked
+                            last_health_state = health
+                            last_health = time.monotonic()
                         except OSError as exc:
                             self.logger(f"Unable to publish execution status: {exc}")
                     for identity, future in list(pending.items()):
