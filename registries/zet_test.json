@@ -1,0 +1,63 @@
+{
+  "subscriber_id": "zet_test",
+  "workers": {
+    "ollama": {
+      "backend": "ollama",
+      "command": [
+        "python3",
+        "-m",
+        "AI_Manager.ollama_proxy_worker"
+      ],
+      "working_directory": "${ZET_PROJECT_ROOT}",
+      "timeout_seconds": 7500
+    },
+    "local_image": {
+      "backend": "comfyui",
+      "command": [
+        "python3",
+        "-m",
+        "AI_Manager.local_image_proxy_worker",
+        "--config",
+        "${ZET_PROJECT_ROOT}/config.toml"
+      ],
+      "working_directory": "${ZET_PROJECT_ROOT}",
+      "timeout_seconds": 7500
+    },
+    "ai_ollama": {
+      "backend": "ollama",
+      "command": [
+        "${AI_PROXY_PYTHON}",
+        "-m",
+        "file_proxy.ai_worker",
+        "--provider",
+        "ollama"
+      ],
+      "working_directory": "${AI_PROXY_PROJECT_ROOT}",
+      "timeout_seconds": 7600
+    },
+    "ai_comfyui": {
+      "backend": "comfyui",
+      "command": [
+        "${AI_PROXY_PYTHON}",
+        "-m",
+        "file_proxy.ai_worker",
+        "--provider",
+        "comfyui"
+      ],
+      "working_directory": "${AI_PROXY_PROJECT_ROOT}",
+      "timeout_seconds": 7600
+    },
+    "ai_codex": {
+      "backend": "codex",
+      "command": [
+        "${AI_PROXY_PYTHON}",
+        "-m",
+        "file_proxy.ai_worker",
+        "--provider",
+        "codex"
+      ],
+      "working_directory": "${AI_PROXY_PROJECT_ROOT}",
+      "timeout_seconds": 7600
+    }
+  }
+}
