@@ -792,6 +792,7 @@ class Proxy:
                     "AI_PROXY_NEXT_RESOURCE_KEY": next_resource_key,
                     "AI_PROXY_EXECUTION_STATE": str(execution_path),
                     "AI_PROXY_RUNTIME_DIR": str(self.local_runtime_dir),
+                    "AI_PROXY_FILE_JOB_KEY": f"{manifest.subscriber_id}/{manifest.job_id}",
                 },
             )
             exit_code = completed.returncode

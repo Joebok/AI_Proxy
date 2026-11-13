@@ -338,7 +338,7 @@ def execute(root: Path, provider: str, *, codex=None, ollama=None, comfyui=None)
             result["ollama_runtime"] = runtime
         try:
             from .ollama_stats_store import OllamaStatsStore
-            record = {**(runtime if isinstance(runtime, dict) else {}), "dispatch_time": result["started_at"], "source": "native", "job_key": f"{ask['subscriber_id']}/{ask['job_id']}", "route": "native", "requested_model": request.get("model"), "outcome": "succeeded" if result["status"] == "SUCCESS" else "failed"}
+            record = {**(runtime if isinstance(runtime, dict) else {}), "dispatch_time": result["started_at"], "source": "native", "job_key": os.environ["AI_PROXY_FILE_JOB_KEY"], "route": "native", "requested_model": request.get("model"), "outcome": "succeeded" if result["status"] == "SUCCESS" else "failed"}
             OllamaStatsStore(Path(os.environ["AI_PROXY_RUNTIME_DIR"])).write(record)
             _write_stats_error_marker(Path(os.environ["AI_PROXY_RUNTIME_DIR"]), None)
         except Exception as exc:
