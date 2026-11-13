@@ -156,6 +156,8 @@ class ProxyDashboard(App[None]):
             state_lines.append(f"Backend: {escape(snapshot.active_backend)}")
         if snapshot.active_job:
             state_lines.append(f"Job: {escape(snapshot.active_job)}")
+        if snapshot.ollama_stats_error:
+            state_lines.append(f"[orange1]{escape(snapshot.ollama_stats_error)}[/orange1]")
         health = snapshot.backend_health or {}
         ollama = health.get("ollama") if isinstance(health, dict) else None
         if isinstance(ollama, dict):

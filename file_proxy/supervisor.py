@@ -52,6 +52,7 @@ class RuntimeSnapshot:
     cache_status: dict[str, object] | None
     logs: tuple[LogEntry, ...]
     backend_health: dict[str, object] | None = None
+    ollama_stats_error: str | None = None
 
 
 class RuntimeSupervisor:
@@ -364,6 +365,13 @@ class RuntimeSupervisor:
         )
         with self._log_lock:
             logs = tuple(self._logs)
+        stats_error = http_state.ollama_stats_error if http_state else None
+        marker = self.proxy.local_runtime_dir / "ollama-stats-error.txt"
+        if marker.is_file():
+            try:
+                stats_error = "Ollama statistics logging failed: " + marker.read_text(encoding="utf-8")[:500]
+            except OSError:
+                stats_error = "Ollama statistics logging failed"
         return RuntimeSnapshot(
             state=effective_state,
             error=self.error,
@@ -380,4 +388,5 @@ class RuntimeSupervisor:
             cache_status=cache_status,
             logs=logs,
             backend_health=backend_health,
+            ollama_stats_error=stats_error,
         )

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import threading
 import time
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -29,6 +30,19 @@ def write_json(path: Path, value) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     _retry_permission_error(lambda: os.replace(temporary, path))
+
+
+def _write_stats_error_marker(runtime_dir: Path, message: str | None) -> None:
+    marker = runtime_dir / "ollama-stats-error.txt"
+    def write_marker() -> None:
+        try:
+            if message:
+                marker.write_text(message[:500], encoding="utf-8")
+            else:
+                marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+    threading.Thread(target=write_marker, daemon=True).start()
 
 
 def _retry_permission_error(operation, timeout_seconds: float = 15.0) -> None:
@@ -172,6 +186,7 @@ def run_codex(root, request, output, executable=None):
 
 
 def run_ollama(root, request, output, upstream):
+    from .ollama_metrics import extract_metrics, sample_residency
     model = request["model"].removeprefix("ollama:")
     content = {"role": "user", "content": request["prompt"]}
     if request.get("images"):
@@ -194,16 +209,17 @@ def run_ollama(root, request, output, upstream):
         payload.update(prompt=request["prompt"], system=request.get("system", ""))
         if content.get("images"):
             payload["images"] = content["images"]
+    dispatched = time.monotonic()
+    request["_ollama_dispatched"] = True
     answer = http_json(upstream.rstrip("/") + "/api/" + api, payload, options.get("timeout_seconds", 7500))
+    relay_ms = round((time.monotonic() - dispatched) * 1000)
     text = str(answer.get("response") or answer.get("message", {}).get("content") or "")
-    if not text.strip():
-        raise ValueError("Ollama returned no answer")
     output.write_text(text, encoding="utf-8")
     runtime = {"provider": "ollama", "requested_alias": model,
                "effective_alias": answer.get("model", model), "effective_model": answer.get("model", model)}
-    for key in ("done_reason", "eval_count", "prompt_eval_count", "total_duration"):
-        if key in answer:
-            runtime[key] = answer[key]
+    runtime.update(extract_metrics(answer, request))
+    runtime.update(sample_residency(upstream, model, runtime["effective_model"]))
+    runtime["relay_ms"] = relay_ms
     return runtime
 
 
@@ -297,6 +313,8 @@ def execute(root: Path, provider: str, *, codex=None, ollama=None, comfyui=None)
             runtime = run_codex(root, request, output, codex)
         elif provider == "ollama":
             runtime = run_ollama(root, request, output, ollama or os.environ.get("AI_PROXY_OLLAMA_UPSTREAM", "http://127.0.0.1:11434"))
+            if not output.read_text(encoding="utf-8").strip():
+                raise ValueError("Ollama returned no answer")
         else:
             runtime = run_comfyui(root, request, output, comfyui or os.environ.get("AI_PROXY_COMFYUI_UPSTREAM", "http://127.0.0.1:8188"))
         if request.get("schema"):
@@ -314,6 +332,17 @@ def execute(root: Path, provider: str, *, codex=None, ollama=None, comfyui=None)
         if isinstance(exc, OSError) and filename and Path(filename).resolve().is_relative_to(root.resolve()):
             result.update(recovery_class="STORAGE_UNAVAILABLE", retryable=True)
     result["completed_at"] = iso_utc(utc_now())
+    if provider == "ollama" and isinstance(locals().get("request"), dict) and request.get("_ollama_dispatched"):
+        runtime = locals().get("runtime", {})
+        if isinstance(runtime, dict):
+            result["ollama_runtime"] = runtime
+        try:
+            from .ollama_stats_store import OllamaStatsStore
+            record = {**(runtime if isinstance(runtime, dict) else {}), "dispatch_time": result["started_at"], "source": "native", "job_key": f"{ask['subscriber_id']}/{ask['job_id']}", "route": "native", "requested_model": request.get("model"), "outcome": "succeeded" if result["status"] == "SUCCESS" else "failed"}
+            OllamaStatsStore(Path(os.environ["AI_PROXY_RUNTIME_DIR"])).write(record)
+            _write_stats_error_marker(Path(os.environ["AI_PROXY_RUNTIME_DIR"]), None)
+        except Exception as exc:
+            _write_stats_error_marker(Path(os.environ["AI_PROXY_RUNTIME_DIR"]), str(exc))
     local = os.environ.get("AI_PROXY_EXECUTION_STATE")
     if local:
         write_json(Path(local).with_suffix(".result.json"), result)

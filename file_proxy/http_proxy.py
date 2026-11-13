@@ -222,6 +222,7 @@ class HttpProxyConfig:
 @dataclass
 class StreamDiagnostics:
     started_at: float = field(default_factory=time.monotonic)
+    started_wall_time: float = field(default_factory=time.time)
     upstream_status: int | None = None
     response_started: bool = False
     chunks: int = 0
@@ -229,10 +230,17 @@ class StreamDiagnostics:
     termination: str | None = None
     error_type: str | None = None
     error: str | None = None
+    first_byte_ms: int | None = None
+    sample: bytearray = field(default_factory=bytearray)
 
     @property
     def elapsed_ms(self) -> int:
         return round((time.monotonic() - self.started_at) * 1000)
+
+
+def _write_ollama_stats(runtime_dir: Path, record: dict[str, object]) -> None:
+    from .ollama_stats_store import OllamaStatsStore
+    OllamaStatsStore(runtime_dir).write(record)
 
 
 def parse_bypass_route(value: str) -> tuple[str, str]:
@@ -380,6 +388,7 @@ class HttpRuntimeState:
     backend_manager: BackendManager | None = None
     store: ExecutionStore | None = None
     ready: asyncio.Event = field(default_factory=asyncio.Event)
+    ollama_stats_error: str | None = None
 
 
 class HttpProxyService:
@@ -397,6 +406,7 @@ class HttpProxyService:
         diagnostic_log: RequestDiagnosticLog | None = None,
         retention_days: int = 7,
         cache_max_bytes: int = 10 * 1024 * 1024 * 1024,
+        statistics_error_callback: Callable[[str], None] | None = None,
     ) -> None:
         config.validate()
         self.config = config
@@ -418,6 +428,7 @@ class HttpProxyService:
         self.retention_days = retention_days
         self.cache_max_bytes = cache_max_bytes
         self._cache_error: str | None = None
+        self.statistics_error_callback = statistics_error_callback
         self._diagnostic_error: str | None = None
 
     def _write_diagnostic(self, event: str, **details: object) -> None:
@@ -682,6 +693,23 @@ class HttpProxyService:
                         error_type=stream_diagnostics.error_type,
                         error=stream_diagnostics.error,
                     )
+                    try:
+                        from datetime import datetime, timezone
+                        from .ollama_metrics import extract_metrics, parse_stream_metrics, sample_residency
+                        payload = json.loads(body or b"{}")
+                        requested = payload.get("model") if isinstance(payload, dict) else None
+                        answer = parse_stream_metrics(bytes(stream_diagnostics.sample))
+                        metrics = extract_metrics(answer, payload) if answer else {}
+                        effective = answer.get("model", requested) if answer else requested
+                        if stream_diagnostics.upstream_status is not None and stream_diagnostics.upstream_status < 300:
+                            metrics.update(await asyncio.to_thread(sample_residency, self._upstream, str(requested or ""), effective))
+                        metrics.update(dispatch_time=datetime.fromtimestamp(stream_diagnostics.started_wall_time, timezone.utc).isoformat(), source="http", job_key=job.request_id, route=request.path, requested_model=requested, effective_model=effective, outcome="succeeded" if stream_diagnostics.upstream_status is not None and stream_diagnostics.upstream_status < 300 else "failed", http_status=stream_diagnostics.upstream_status, queue_wait_ms=max(0, round((stream_diagnostics.started_at-job.enqueued_at)*1000)), first_byte_ms=stream_diagnostics.first_byte_ms, relay_ms=stream_diagnostics.elapsed_ms)
+                        await asyncio.to_thread(_write_ollama_stats, self.store.runtime_dir, metrics)
+                        if self.statistics_error_callback:
+                            self.statistics_error_callback("")
+                    except Exception as stats_exc:
+                        if self.statistics_error_callback:
+                            self.statistics_error_callback(f"Ollama statistics logging failed: {stats_exc}")
             if track_ollama:
                 outcome = (
                     "upstream_completed_after_disconnect"
@@ -1176,6 +1204,12 @@ class HttpProxyService:
                     diagnostics.response_started = True
                 async for chunk in upstream.content.iter_chunked(64 * 1024):
                     if diagnostics:
+                        if diagnostics.first_byte_ms is None:
+                            diagnostics.first_byte_ms = diagnostics.elapsed_ms
+                        if len(diagnostics.sample) + len(chunk) <= 1024 * 1024:
+                            diagnostics.sample.extend(chunk)
+                        else:
+                            diagnostics.sample.clear()
                         diagnostics.chunks += 1
                         diagnostics.bytes += len(chunk)
                     await downstream.write(chunk)
@@ -1334,6 +1368,21 @@ async def run_http_proxies(
         logger,
     )
     reasoning_policies.refresh()
+    def set_statistics_error(message: str) -> None:
+        if runtime_state is None:
+            return
+        runtime_state.ollama_stats_error = message or None
+        marker = Path(runtime.runtime_dir) / "ollama-stats-error.txt"
+        def update_marker() -> None:
+            try:
+                if message:
+                    marker.write_text(message[:500], encoding="utf-8")
+                else:
+                    marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+        asyncio.create_task(asyncio.to_thread(update_marker))
+
     services = [
         HttpProxyService(
             config,
@@ -1347,6 +1396,7 @@ async def run_http_proxies(
             diagnostic_log=diagnostic_log,
             retention_days=runtime.retention_days if runtime else 7,
             cache_max_bytes=runtime.cache_max_bytes if runtime else 10 * 1024 * 1024 * 1024,
+            statistics_error_callback=set_statistics_error if runtime_state and config.profile.name == "ollama" else None,
         )
         for config in configs
     ]

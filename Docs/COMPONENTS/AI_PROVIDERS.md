@@ -31,6 +31,12 @@ runtime/model evidence, timestamps and bounded error text. Proxy transport resul
 and inventories remain engine-owned. Subscriber-side application must check both
 the transport result and application result.
 
+Native Ollama performance evidence is also recorded locally in
+`ollama_stats.sqlite3`. Export with `python -m file_proxy.ollama_stats
+--runtime-dir PATH`. The CSV excludes prompts and answers. Compare rows with the
+same model digest, quantization, context and thinking settings. Backend load and
+generation durations are nanoseconds; queue wait is separate from generation.
+
 ## Scheduling and failure ownership
 
 Trusted registry `backend=codex` selects the independent cloud dispatcher.

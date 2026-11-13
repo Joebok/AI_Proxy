@@ -110,6 +110,7 @@ to CLI options; see [DEVELOPMENT.md](DEVELOPMENT.md).
 | `cache/<prompt_id>/<hash>-<filename>` | Archived standard ComfyUI artifacts fetched via `/view`; `.partial` write becomes final by replace. Mapping is stored in artifacts table. |
 | `comfyui.log` / backups | Backend process stdout/stderr, size-bounded rotation; not the same privacy contract as HTTP request diagnostics. |
 | `request-diagnostics/requests-YYYY-MM-DD.jsonl` | `RequestDiagnosticLog`: UTC rolling dispatch/terminal diagnostics; callers record identity, route, transport reason, elapsed time, byte/chunk counts. No request/response bodies or headers at current call sites. |
+| `ollama_stats.sqlite3` | `OllamaStatsStore`: versioned, prompt-free Ollama performance rows retained for 90 days and exported with `python -m file_proxy.ollama_stats --runtime-dir PATH`. |
 
 `executions` identifies HTTP work by UUID `request_id`, optional globally unique
 `prompt_id`, backend, free-form state/outcome, error, timestamps, and optional
