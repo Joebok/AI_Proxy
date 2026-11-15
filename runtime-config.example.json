@@ -1,5 +1,14 @@
 {
   "runtime_dir": "C:\\Users\\Joe\\AppData\\Local\\AI_Proxy",
+  "managed_ollama": {
+    "enabled": false,
+    "executable": "C:\\Users\\Joe\\AppData\\Local\\Programs\\Ollama\\ollama.exe",
+    "upstream": "http://127.0.0.1:11434",
+    "inference_timeout_seconds": 300,
+    "startup_deadline_seconds": 60,
+    "shutdown_deadline_seconds": 15,
+    "recovery_cooldown_seconds": 30
+  },
   "managed_comfyui": {
     "enabled": false,
     "executable": "D:\\Comfy-Desktop\\ComfyUI\\ComfyUI\\.venv\\Scripts\\python.exe",

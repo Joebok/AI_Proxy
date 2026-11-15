@@ -444,6 +444,10 @@ class HttpProxyService:
                 self._diagnostic_error = message
 
     def _route_is_queued(self, route: tuple[str, str]) -> bool:
+        if (self.backend_manager and self.backend_manager.ollama_config
+                and self.backend_manager.ollama_config.enabled
+                and self.profile.name == "ollama" and route in MODEL_ROUTES):
+            return True
         if self.profile.queue_all_except_bypass:
             return route not in self.config.bypass_routes
         if self.backend_manager and self.backend_manager.config.enabled:
@@ -1174,6 +1178,7 @@ class HttpProxyService:
         body: bytes,
         request_id: str | None,
         diagnostics: StreamDiagnostics | None = None,
+        _ollama_attempt: int = 0,
     ) -> web.StreamResponse:
         assert self._session is not None
         url = f"{self._upstream}{request.raw_path}"
@@ -1246,8 +1251,22 @@ class HttpProxyService:
                 diagnostics.error_type = type(exc).__name__
                 diagnostics.error = str(exc)
             if downstream is None:
+                if (self.profile.name == "ollama" and self.backend_manager
+                        and self.backend_manager.ollama_config
+                        and self.backend_manager.ollama_config.enabled):
+                    if _ollama_attempt == 0:
+                        self.logger(f"Ollama HTTP request {request_id} timed out before headers; restarting and retrying once")
+                        await self.backend_manager.restart_ollama()
+                        return await self._relay(request, body, request_id, diagnostics, 1)
+                    self.logger(f"Ollama HTTP request {request_id} timed out on retry")
+                    await self.backend_manager.restart_ollama()
                 raise web.HTTPGatewayTimeout(text="upstream timed out") from None
             downstream.force_close()
+            if (self.profile.name == "ollama" and self.backend_manager
+                    and self.backend_manager.ollama_config
+                    and self.backend_manager.ollama_config.enabled):
+                self.logger(f"Ollama HTTP request {request_id} timed out after stream headers; restarting backend")
+                await self.backend_manager.restart_ollama()
             raise web.HTTPGatewayTimeout(text="upstream stream timed out ambiguously") from None
         except (aiohttp.ClientError, ConnectionError, OSError) as exc:
             if diagnostics:
@@ -1349,7 +1368,7 @@ async def run_http_proxies(
     )
     ollama_upstream = next(
         (config.upstream for config in configs if config.profile.name == "ollama"),
-        "http://127.0.0.1:11434",
+        runtime.managed_ollama.upstream if runtime and runtime.managed_ollama.enabled else "http://127.0.0.1:11434",
     )
     proxy.ollama_upstream = ollama_upstream
     proxy.comfyui_upstream = runtime.managed_comfyui.upstream if runtime else next(
@@ -1359,6 +1378,8 @@ async def run_http_proxies(
         if runtime
         else None
     )
+    if manager and runtime.managed_ollama.enabled:
+        manager.configure_ollama(runtime.managed_ollama)
     admission = AdmissionController(
         runtime.max_admitted_requests if runtime else min(c.max_admitted_requests for c in configs),
         runtime.max_buffered_body_bytes if runtime else min(c.max_buffered_body_bytes for c in configs),
@@ -1423,6 +1444,8 @@ async def run_http_proxies(
     proxy.logger(f"Queue root: {proxy.root}")
     with proxy.lock():
         proxy.logger(f"Lock acquired: {proxy.local_runtime_dir / 'proxy.lock'}")
+        if manager and runtime and runtime.managed_ollama.enabled:
+            await manager.ensure_ollama()
         recovered = proxy.recover_interrupted() if filesystem_ready else 0
         if recovered:
             proxy.logger(f"Recovered {recovered} interrupted job(s)")

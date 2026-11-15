@@ -116,3 +116,11 @@ disconnect, eviction or external unresolved cancellation branch.
 Related: [INVARIANTS.md](../INVARIANTS.md),
 [execution ownership ADR](../DECISIONS/0002-shared-execution-and-backend-ownership.md),
 [managed runtime](MANAGED_RUNTIME.md), [reasoning policy](REASONING_POLICY.md).
+# Managed Ollama deadline
+
+When `managed_ollama.enabled` is set, queued Ollama model routes use the
+configured inference deadline. A timeout before downstream headers triggers one
+managed server restart and one retry. A timeout after headers aborts the stream
+and restarts Ollama before the shared scheduler advances. A timeout on the second
+attempt restarts Ollama and returns gateway timeout. Queue wait expiration and
+ordinary completed upstream errors do not restart the backend.

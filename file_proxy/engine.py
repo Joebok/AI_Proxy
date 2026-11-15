@@ -793,6 +793,7 @@ class Proxy:
                     "AI_PROXY_EXECUTION_STATE": str(execution_path),
                     "AI_PROXY_RUNTIME_DIR": str(self.local_runtime_dir),
                     "AI_PROXY_FILE_JOB_KEY": f"{manifest.subscriber_id}/{manifest.job_id}",
+                    "AI_PROXY_OLLAMA_TIMEOUT_SECONDS": str(self.runtime_config.managed_ollama.inference_timeout_seconds if getattr(self, "runtime_config", None) and self.runtime_config.managed_ollama.enabled else 7500.0),
                 },
             )
             exit_code = completed.returncode
@@ -1196,7 +1197,18 @@ class Proxy:
                     continue
             worker_task = asyncio.create_task(asyncio.to_thread(self._process_file_job, selected))
             try:
-                await asyncio.shield(worker_task)
+                restart_request = self._execution_path(selected.manifest.subscriber_id, selected.manifest.job_id).with_suffix(".ollama-restart.json") if isinstance(selected, QueueJob) else None
+                while not worker_task.done():
+                    done, _ = await asyncio.wait({worker_task}, timeout=0.2)
+                    if restart_request and restart_request.is_file() and backend_manager:
+                        try:
+                            await backend_manager.restart_ollama()
+                            restart_request.with_suffix(".ollama-restart.json.ack").write_text("ready", encoding="utf-8")
+                            self.logger(f"Ollama restarted for {selected.manifest.job_id}")
+                        except Exception as exc:
+                            restart_request.with_suffix(".ollama-restart.json.ack").write_text(f"failed: {exc}"[:500], encoding="utf-8")
+                        restart_request.unlink(missing_ok=True)
+                await worker_task
             except OSError as exc:
                 self._filesystem_degraded = str(exc)
                 self.logger(f"Filesystem processing degraded: {exc}")

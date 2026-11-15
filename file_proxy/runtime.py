@@ -25,10 +25,22 @@ class ManagedComfyUIConfig:
 
 
 @dataclass(frozen=True)
+class ManagedOllamaConfig:
+    enabled: bool = False
+    executable: str | None = None
+    upstream: str = "http://127.0.0.1:11434"
+    inference_timeout_seconds: float = 300.0
+    startup_deadline_seconds: float = 60.0
+    shutdown_deadline_seconds: float = 15.0
+    recovery_cooldown_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     runtime_dir: str = ".ai-proxy-runtime"
     ollama_reasoning_policy_path: str | None = None
     managed_comfyui: ManagedComfyUIConfig = field(default_factory=ManagedComfyUIConfig)
+    managed_ollama: ManagedOllamaConfig = field(default_factory=ManagedOllamaConfig)
     generation_settlement_seconds: float = 7500.0
     cancellation_grace_seconds: float = 30.0
     queue_wait_seconds: float = 1800.0
@@ -57,6 +69,7 @@ class RuntimeConfig:
         if unknown:
             raise ValueError(f"unknown runtime configuration setting(s): {', '.join(sorted(unknown))}")
         managed = data.pop("managed_comfyui", {})
+        ollama = data.pop("managed_ollama", {})
         if not isinstance(managed, dict):
             raise ValueError("managed_comfyui must contain an object")
         managed_known = {item.name for item in fields(ManagedComfyUIConfig)}
@@ -72,7 +85,14 @@ class RuntimeConfig:
             if not isinstance(data["codex_models"], list):
                 raise ValueError("codex_models must be a list of model names")
             data["codex_models"] = tuple(data["codex_models"])
-        result = cls(managed_comfyui=ManagedComfyUIConfig(**managed), **data)
+        if not isinstance(ollama, dict):
+            raise ValueError("managed_ollama must contain an object")
+        ollama_known = {item.name for item in fields(ManagedOllamaConfig)}
+        ollama_unknown = set(ollama) - ollama_known
+        if ollama_unknown:
+            raise ValueError(f"unknown managed_ollama setting(s): {', '.join(sorted(ollama_unknown))}")
+        result = cls(managed_comfyui=ManagedComfyUIConfig(**managed),
+                     managed_ollama=ManagedOllamaConfig(**ollama), **data)
         result.validate(path.parent)
         return result
 
@@ -95,6 +115,7 @@ class RuntimeConfig:
             runtime_dir=str(runtime_dir if runtime_dir.is_absolute() else (base / runtime_dir).resolve()),
             ollama_reasoning_policy_path=absolute(self.ollama_reasoning_policy_path),
             managed_comfyui=managed,
+            managed_ollama=replace(self.managed_ollama, executable=absolute(self.managed_ollama.executable)),
         )
 
     def validate(self, base: Path | None = None) -> None:
@@ -116,6 +137,23 @@ class RuntimeConfig:
         }
         if any(isinstance(value, bool) or value <= 0 for value in positive.values()):
             raise ValueError("runtime limits must be positive")
+        ollama = self.managed_ollama
+        for name in ("inference_timeout_seconds", "startup_deadline_seconds", "shutdown_deadline_seconds",
+                     "recovery_cooldown_seconds"):
+            value = getattr(ollama, name)
+            if isinstance(value, bool) or value <= 0:
+                raise ValueError(f"managed_ollama.{name} must be positive")
+        if ollama.enabled:
+            if not ollama.executable:
+                raise ValueError("managed_ollama requires executable")
+            parsed = urlsplit(ollama.upstream)
+            if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+                raise ValueError("managed_ollama upstream must be loopback HTTP")
+            executable = Path(ollama.executable)
+            if not executable.is_absolute():
+                executable = (base or Path.cwd()) / executable
+            if not executable.is_file():
+                raise ValueError(f"managed Ollama executable does not exist: {executable}")
         managed = self.managed_comfyui
         if managed.enabled and (not managed.executable or not managed.working_directory):
             raise ValueError("managed ComfyUI requires executable and working_directory")

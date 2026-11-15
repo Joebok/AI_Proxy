@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
-from .runtime import ManagedComfyUIConfig
+from .runtime import ManagedComfyUIConfig, ManagedOllamaConfig
 
 
 class BackendUnavailable(RuntimeError):
@@ -57,6 +57,91 @@ class BackendManager:
         self._logs: deque[str] = deque(maxlen=200)
         self._log_thread: threading.Thread | None = None
         self._transitions: deque[dict[str, object]] = deque(maxlen=50)
+        self.ollama_config: ManagedOllamaConfig | None = None
+        self._ollama_process: subprocess.Popen[bytes] | None = None
+        self._ollama_job_handle: int | None = None
+        self._ollama_cooldown_until = 0.0
+
+    def configure_ollama(self, config: ManagedOllamaConfig) -> None:
+        self.ollama_config = config
+
+    async def ensure_ollama(self) -> None:
+        config = self.ollama_config
+        if not config or not config.enabled:
+            return
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            if now < self._ollama_cooldown_until:
+                raise BackendUnavailable("Managed Ollama recovery is cooling down after a failure")
+            if self._ollama_process and self._ollama_process.poll() is None:
+                if await self._ollama_ready():
+                    return
+                self._ollama_cooldown_until = now + config.recovery_cooldown_seconds
+                raise BackendUnavailable("Managed Ollama process is running but /api/ps is unhealthy")
+            if await self._ollama_reachable():
+                raise BackendUnavailable(
+                    "Another Ollama process occupies the configured upstream. Stop the tray app first."
+                )
+            flags = 0
+            startupinfo = None
+            if os.name == "nt":
+                flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW | 0x00000004
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            try:
+                self._ollama_process = subprocess.Popen(
+                    [str(Path(config.executable or "").resolve()), "serve"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    shell=False, creationflags=flags, startupinfo=startupinfo,
+                    env={**os.environ, "OLLAMA_HOST": urlsplit(config.upstream).netloc},
+                )
+                if os.name == "nt":
+                    self._ollama_job_handle = assign_windows_job(self._ollama_process)
+                    self._resume_windows_process(self._ollama_process.pid)
+                deadline = now + config.startup_deadline_seconds
+                while asyncio.get_running_loop().time() < deadline:
+                    if self._ollama_process.poll() is not None:
+                        raise BackendUnavailable("Managed Ollama exited before becoming ready")
+                    if await self._ollama_ready():
+                        self.logger(f"Started managed Ollama process {self._ollama_process.pid}")
+                        self._ollama_cooldown_until = 0.0
+                        return
+                    await asyncio.sleep(0.25)
+                raise BackendUnavailable("Managed Ollama startup deadline expired")
+            except BaseException:
+                await self.stop_ollama()
+                self._ollama_cooldown_until = asyncio.get_running_loop().time() + config.recovery_cooldown_seconds
+                raise
+
+    async def _ollama_reachable(self) -> bool:
+        try:
+            timeout = aiohttp.ClientTimeout(total=1)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"{(self.ollama_config.upstream if self.ollama_config else self.ollama_upstream).rstrip('/')}/api/ps") as response:
+                    return response.status < 300
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            return False
+
+    async def _ollama_ready(self) -> bool:
+        return await self._ollama_reachable()
+
+    async def restart_ollama(self) -> None:
+        await self.stop_ollama()
+        await self.ensure_ollama()
+
+    async def stop_ollama(self) -> None:
+        process, self._ollama_process = self._ollama_process, None
+        if process and process.poll() is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(asyncio.to_thread(process.wait), self.ollama_config.shutdown_deadline_seconds if self.ollama_config else 15)
+            except asyncio.TimeoutError:
+                process.kill()
+                await asyncio.to_thread(process.wait)
+        if self._ollama_job_handle and os.name == "nt":
+            import ctypes
+            ctypes.windll.kernel32.CloseHandle(self._ollama_job_handle)
+            self._ollama_job_handle = None
 
     def _set_state(self, state: str) -> None:
         if state != self.state:
@@ -135,6 +220,8 @@ class BackendManager:
             await self.ensure_comfyui(ollama_upstream or self.ollama_upstream)
         elif backend == "ollama" and self.config.enabled:
             await self.stop_comfyui()
+        if backend == "ollama":
+            await self.ensure_ollama()
         self.active_backend = backend
         self.active_job = job_id
         if backend and (not self.config.enabled or backend != "comfyui" or self.state == "ready"):
@@ -421,6 +508,8 @@ class BackendManager:
             self._job_handle = None
 
     async def close(self) -> None:
+        if self.ollama_config and self.ollama_config.enabled:
+            await self.stop_ollama()
         if self.config.enabled and self._process is not None:
             await self.stop_comfyui()
 

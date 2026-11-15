@@ -3,7 +3,9 @@
 ## Responsibility and interfaces
 
 [backend.py](../../file_proxy/backend.py) `BackendManager` owns optional ComfyUI
-processes and safe residency transitions; it does not own the Ollama server.
+processes and safe residency transitions. Optional managed Ollama mode starts
+`ollama.exe serve` as a shell-free child and assigns a Windows kill-on-close Job
+Object. It refuses an already reachable upstream.
 [supervisor.py](../../file_proxy/supervisor.py) `RuntimeSupervisor` owns a restartable
 runtime for [tui.py](../../file_proxy/tui.py) `ProxyDashboard`. Consumers are CLI,
 shared scheduler, HTTP status/lifecycle and dashboard. Inputs are validated runtime
@@ -33,6 +35,11 @@ backend, then records active backend/job. ComfyUI work calls `ensure_comfyui`:
 
 Managed Ollama work first calls `stop_comfyui`, terminates only owned process and
 confirms endpoint no longer reachable. Shutdown uses terminate/wait/deadline/kill.
+With `managed_ollama.enabled`, startup also starts Ollama and a trusted native
+Ollama worker timeout requests a restart through its local execution journal.
+The scheduler waits for restart readiness before acknowledging the worker retry.
+The native worker retries one inference after the first timeout. A second timeout
+is terminal. Managed lifecycle must be run through `run` or `tui`, not `once`.
 Windows starts hidden and suspended, assigns a kill-on-close Job Object for
 descendants, then resumes the process. Non-Windows termination addresses the
 process; equivalent descendant containment is not implemented/verified.

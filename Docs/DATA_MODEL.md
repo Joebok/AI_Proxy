@@ -5,6 +5,11 @@ Definitions in [models.py](../file_proxy/models.py), [runtime.py](../file_proxy/
 are authoritative. This document explains contracts and lifecycle without copying
 complete schemas. There is no subscriber business database in this project.
 
+`managed_ollama` is an opt-in runtime object. It names the installed Ollama
+executable and loopback upstream and configures the per-attempt inference deadline,
+startup deadline, shutdown deadline, and recovery cooldown. Defaults are 300, 60,
+15, and 30 seconds. A managed server is a child owned by AI_Proxy.
+
 ## Filesystem protocol
 
 | Entity | Definition / ownership / lifecycle |

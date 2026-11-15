@@ -65,3 +65,6 @@ native submission guard recovery through verified managed backend stop.
 
 ## Storage recovery (2026-10-17)
 [ADR 0006](DECISIONS/0006-storage-outage-recovery.md) records fixed-local witnesses, reconnect reconciliation, native submission evidence, and subscriber-owned fresh attempts. File transport and native provider components retain interface ownership.
+
+## Managed Ollama recovery (2026-11-15)
+[ADR 0007](DECISIONS/0007-managed-ollama-recovery.md) records opt-in process ownership and the timeout recovery contract. Real tray-app cutover remains pending.

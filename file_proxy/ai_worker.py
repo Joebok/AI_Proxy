@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import threading
 import time
+import socket
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
@@ -211,7 +212,32 @@ def run_ollama(root, request, output, upstream):
             payload["images"] = content["images"]
     dispatched = time.monotonic()
     request["_ollama_dispatched"] = True
-    answer = http_json(upstream.rstrip("/") + "/api/" + api, payload, options.get("timeout_seconds", 7500))
+    timeout = min(float(options.get("timeout_seconds", 7500)),
+                  float(os.environ.get("AI_PROXY_OLLAMA_TIMEOUT_SECONDS", 300)))
+    restart_path = Path(os.environ["AI_PROXY_EXECUTION_STATE"]).with_suffix(".ollama-restart.json") if os.environ.get("AI_PROXY_EXECUTION_STATE") else None
+    for attempt in range(2):
+        dispatched = time.monotonic()
+        request["_ollama_dispatched"] = True
+        try:
+            answer = http_json(upstream.rstrip("/") + "/api/" + api, payload, timeout)
+            break
+        except (TimeoutError, socket.timeout) as exc:
+            if restart_path is None:
+                raise ProviderError("OLLAMA_TIMEOUT", f"Ollama exceeded {timeout:g} seconds.") from exc
+            ack = restart_path.with_suffix(".ollama-restart.json.ack")
+            ack.unlink(missing_ok=True)
+            restart_path.write_text(json.dumps({"attempt": attempt + 1, "model": model}), encoding="utf-8")
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline and not ack.is_file():
+                time.sleep(0.1)
+            if not ack.is_file():
+                raise ProviderError("OLLAMA_RECOVERY_FAILED", "Timed out waiting for Ollama restart.") from exc
+            status = ack.read_text(encoding="utf-8")
+            ack.unlink(missing_ok=True)
+            if status != "ready":
+                raise ProviderError("OLLAMA_RECOVERY_FAILED", status[:400]) from exc
+            if attempt:
+                raise ProviderError("OLLAMA_TIMEOUT", f"Ollama exceeded {timeout:g} seconds twice.") from exc
     relay_ms = round((time.monotonic() - dispatched) * 1000)
     text = str(answer.get("response") or answer.get("message", {}).get("content") or "")
     output.write_text(text, encoding="utf-8")

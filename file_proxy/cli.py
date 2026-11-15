@@ -78,7 +78,8 @@ def _http_configs(
                 upstream=args.ollama_upstream,
                 continuation_grace_seconds=args.http_continuation_grace_seconds,
                 max_body_bytes=args.http_max_body_bytes if args.http_max_body_bytes is not None else 100 * 1024 * 1024,
-                upstream_timeout_seconds=runtime.generation_settlement_seconds,
+                upstream_timeout_seconds=min(runtime.generation_settlement_seconds,
+                    runtime.managed_ollama.inference_timeout_seconds if runtime.managed_ollama.enabled else runtime.generation_settlement_seconds),
                 queue_wait_seconds=runtime.queue_wait_seconds,
                 max_admitted_requests=runtime.max_admitted_requests,
                 max_buffered_body_bytes=runtime.max_buffered_body_bytes,
@@ -134,6 +135,10 @@ def main(argv: list[str] | None = None) -> int:
         cli_comfyui_upstream = getattr(args, "comfyui_upstream", None)
         comfyui_upstream = cli_comfyui_upstream if cli_comfyui_upstream is not None else runtime.managed_comfyui.upstream
         runtime = replace(runtime, managed_comfyui=replace(runtime.managed_comfyui, upstream=comfyui_upstream))
+        if runtime.managed_ollama.enabled:
+            if args.command == "once":
+                raise ValueError("once cannot own managed Ollama; use run or tui")
+            args.ollama_upstream = runtime.managed_ollama.upstream
         runtime.validate()
         registry = Registry.load(args.registry_dir)
         logger = (lambda message: print(f"[file-proxy] {message}", flush=True)) if args.command == "run" else None
@@ -152,12 +157,13 @@ def main(argv: list[str] | None = None) -> int:
             forge_cleanup_required=getattr(args, "require_forge_cleanup", False),
         )
         proxy.ollama_upstream = getattr(args, "ollama_upstream", proxy.ollama_upstream)
+        proxy.runtime_config = runtime
         proxy.comfyui_upstream = runtime.managed_comfyui.upstream
         if args.command in {"run", "tui"}:
             configs = _http_configs(args, runtime, comfyui_upstream)
         if args.command == "run":
             try:
-                if not configs and not runtime.managed_comfyui.enabled:
+                if not configs and not runtime.managed_comfyui.enabled and not runtime.managed_ollama.enabled:
                     proxy.run(args.poll_seconds)
                 else:
                     asyncio.run(

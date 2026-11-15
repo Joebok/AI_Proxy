@@ -131,7 +131,8 @@ class RuntimeSupervisor:
         self.proxy._filesystem_degraded = None
         self.log("dashboard", "Starting proxy runtime.")
         try:
-            if self.configs or self.runtime_config.managed_comfyui.enabled:
+            if (self.configs or self.runtime_config.managed_comfyui.enabled
+                    or self.runtime_config.managed_ollama.enabled):
                 state = HttpRuntimeState()
                 self._http_state = state
                 self._task = asyncio.create_task(
@@ -190,6 +191,8 @@ class RuntimeSupervisor:
                     "Managed ComfyUI backend is stopped until a ComfyUI job arrives; "
                     + ("configured listeners are ready." if self.configs else "the file scheduler is ready."),
                 )
+            if self.runtime_config.managed_ollama.enabled:
+                self.log("dashboard", "Managed Ollama is ready for local inference.")
             if self._task is not None:
                 self._task.add_done_callback(self._runtime_done)
             return True
